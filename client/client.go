@@ -45,6 +45,25 @@ func (c *Client) StartProcess(command string, args ...string) error {
 	return nil
 }
 
+func (c *Client) StopProcess() error {
+	if c.cmd != nil {
+		if err := c.cmd.Process.Kill(); err != nil {
+			return err
+		}
+	}
+	if c.stdin != nil {
+		if err := c.stdin.Close(); err != nil {
+			return err
+		}
+	}
+	if c.stdout != nil {
+		if err := c.stdout.Close(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (c *Client) ConnectHTTP(baseURL string) {
 	c.transport = "http"
 	c.baseURL = baseURL
