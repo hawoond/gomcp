@@ -56,7 +56,7 @@ func main() {
 
 ---
 
-# gomcp
+# gomcp(Korean Documentation)
 
 **Go 언어로 구현된 Model Context Protocol(MCP) 패키지입니다.**  
 대규모 언어 모델(LLM)과 외부 도구·데이터 소스를 표준화된 방식으로 연결하고, Resource · Tool · Prompt를 손쉽게 등록·관리할 수 있습니다.  
@@ -65,11 +65,11 @@ JSON-RPC 2.0을 기반으로 STDIO와 HTTP(SSE) 전송 방식을 모두 지원�
 ## 주요 특징
 
 - **Resource**: URI로 노출되는 데이터 소스
-- **Tool**: LLM이 호출 가능한 함수(작업)
+- **Tool**: LLM이 호출 가능한 함수/동작
 - **Prompt**: 대화형 메시지 템플릿
 - **JSON-RPC 2.0**: 표준화된 RPC 프로토콜
 - **Transport**: STDIO 및 HTTP(SSE) 지원
-- **Go 언어**: 고루틴을 통한 동시성 처리로 높은 성능
+- **Go 언어**: 아마 고루틴을 통한 동시성 처리로 높은 성능
 
 ## 설치
 
@@ -91,17 +91,17 @@ func main() {
     srv := server.NewServer("MyApp", "1.0")
 
     // Tool 등록
-    srv.AddTool("add", "두 수를 더함", func(a int, b int) int {
+    srv.AddTool("add", "Adds two integers", func(a int, b int) int {
         return a + b
     })
 
     // Resource 등록
-    srv.AddResource("const://hello", "고정 인사말", func() string {
+    srv.AddResource("const://hello", "A constant greeting", func() string {
         return "Hello from MCP!"
     })
 
     // Prompt 등록
-    srv.AddPrompt("echoPrompt", "메시지 에코", func(msg string) string {
+    srv.AddPrompt("echoPrompt", "Echo the message", func(msg string) string {
         return "Echo: " + msg
     })
 

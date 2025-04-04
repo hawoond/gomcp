@@ -12,8 +12,8 @@ import (
 	"strings"
 	"sync"
 
-	"mcp/internal/types"
-	"mcp/internal/util"
+	"github.com/hawoond/gomcp/internal/types"
+	"github.com/hawoond/gomcp/internal/util"
 )
 
 type Resource struct {
@@ -130,7 +130,7 @@ func (s *Server) AddPrompt(name string, description string, handler interface{})
 }
 
 func (s *Server) RunStdio() error {
-	log.Printf("STDIO를 통한 MCP 서버 시작: %s (v%s)", s.Name, s.Version)
+	log.Printf("Starting MCP server via STDIO: %s (v%s)", s.Name, s.Version)
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt)
 	go func() {

@@ -4,7 +4,7 @@ import (
 	"flag"
 	"log"
 
-	"mcp/server"
+	"github.com/hawoond/gomcp/server"
 )
 
 func main() {

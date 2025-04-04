@@ -8,8 +8,8 @@ import (
 	"os/exec"
 	"sync"
 
-	"mcp/internal/types"
-	"mcp/internal/util"
+	"github.com/hawoond/gomcp/internal/types"
+	"github.com/hawoond/gomcp/internal/util"
 )
 
 type Client struct {

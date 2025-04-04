@@ -1,3 +1,3 @@
-module mcp
+module github.com/hawoond/gomcp
 
-go 1.23.7
+go 1.24.2
