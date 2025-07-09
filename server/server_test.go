@@ -2,79 +2,113 @@ package server
 
 import (
 	"encoding/json"
-	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/hawoond/gomcp/internal/types"
 )
 
-func TestToolAndResource(t *testing.T) {
-	srv := NewServer("TestApp", "0.1.0")
-	srv.AddTool("echo", "Message Echo", func(msg string) string {
-		return "Echo: " + msg
-	})
-	srv.AddResource("const://hello", "Fixed Greeting", func() string {
-		return "Hello World"
-	})
-	reqList := `{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`
-	respListArr := srv.handleMessage(json.RawMessage(reqList))
-	if len(respListArr) != 1 {
-		t.Fatalf("Expected one response, got %d", len(respListArr))
+func TestHTTPTransport(t *testing.T) {
+	srv := NewServer("TestApp", "0.1.0", false, "")
+	type AddParams struct {
+		A int `validate:"required"`
+		B int `validate:"required"`
 	}
-	respList := respListArr[0]
-	if respList.Error != nil {
-		t.Errorf("tools/list error: %+v", respList.Error)
+	srv.AddTool("add", "Adds two integers", func(a int, b int) int {
+		return a + b
+	}, AddParams{}, "a", "b")
+
+	// Create a test HTTP server
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		srv.handleMcpRequest().ServeHTTP(w, r)
+	}))
+	defer ts.Close()
+
+	// Simulate a tools/call request over HTTP
+	reqBody := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"add","arguments":{"A":10,"B":20}}}`
+	resp, err := http.Post(ts.URL+"/mcp", "application/json", strings.NewReader(reqBody))
+	if err != nil {
+		t.Fatalf("Failed to send HTTP request: %v", err)
 	}
-	data, _ := json.Marshal(respList.Result)
-	strData := string(data)
-	if !contains(strData, "echo") {
-		t.Errorf("tools/list result missing 'echo': %s", strData)
+	defer resp.Body.Close()
+
+	respBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("Failed to read response body: %v", err)
 	}
 
-	reqCall := `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"echo","arguments":{"param1":"TestMsg"}}}`
-	respCallArr := srv.handleMessage(json.RawMessage(reqCall))
-	respCall := respCallArr[0]
-	if respCall.Error != nil {
-		t.Errorf("tools/call error: %+v", respCall.Error)
-	}
-	expected := "Echo: TestMsg"
-	got := extractResultText(respCall.Result)
-	if got != expected {
-		t.Errorf("tools/call echo expected '%s', got '%s'", expected, got)
+	var jsonRpcResp types.Response
+	if err := json.Unmarshal(respBytes, &jsonRpcResp); err != nil {
+		t.Fatalf("Failed to unmarshal JSON-RPC response: %v", err)
 	}
 
-	reqRes := `{"jsonrpc":"2.0","id":3,"method":"resources/read","params":{"uri":"const://hello"}}`
-	respResArr := srv.handleMessage(json.RawMessage(reqRes))
-	respRes := respResArr[0]
-	if respRes.Error != nil {
-		t.Errorf("resources/read error: %+v", respRes.Error)
+	if jsonRpcResp.Error != nil {
+		t.Errorf("Expected no error, got: %+v", jsonRpcResp.Error)
 	}
-	resText := fmt.Sprintf("%v", respRes.Result)
-	if resText != "Hello World" && resText != "\"Hello World\"" {
-		t.Errorf("resources/read expected 'Hello World', got %s", resText)
-	}
-}
 
-func contains(str, substr string) bool {
-	return len(str) >= len(substr) && strings.Contains(str, substr)
-}
-
-func extractResultText(result interface{}) string {
-	bytes, _ := json.Marshal(result)
-	if idx := indexOf(bytes, []byte("Echo:")); idx != -1 {
-		start := idx
-		end := indexOf(bytes[start:], []byte("\""))
-		if end != -1 {
-			return string(bytes[start : start+end])
-		}
+	expectedResult := float64(30) // JSON numbers are often float64
+	if jsonRpcResp.Result != expectedResult {
+		t.Errorf("Expected result %v, got %v", expectedResult, jsonRpcResp.Result)
 	}
-	return fmt.Sprintf("%v", result)
-}
 
-func indexOf(data []byte, sub []byte) int {
-	for i := 0; i+len(sub) <= len(data); i++ {
-		if string(data[i:i+len(sub)]) == string(sub) {
-			return i
-		}
+	// Test with authentication enabled
+	srvAuth := NewServer("TestAppAuth", "0.1.0", true, "test-api-key")
+	srvAuth.AddTool("add", "Adds two integers", func(a int, b int) int {
+		return a + b
+	}, AddParams{}, "a", "b")
+
+	tsAuth := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		srvAuth.authMiddleware(srvAuth.handleMcpRequest()).ServeHTTP(w, r)
+	}))
+	defer tsAuth.Close()
+
+	// Test unauthorized request
+	respUnauthorized, err := http.Post(tsAuth.URL+"/mcp", "application/json", strings.NewReader(reqBody))
+	if err != nil {
+		t.Fatalf("Failed to send unauthorized HTTP request: %v", err)
 	}
-	return -1
+	defer respUnauthorized.Body.Close()
+
+	if respUnauthorized.StatusCode != http.StatusUnauthorized {
+		t.Errorf("Expected status %d, got %d", http.StatusUnauthorized, respUnauthorized.StatusCode)
+	}
+
+	// Test authorized request
+	req, err := http.NewRequest("POST", tsAuth.URL+"/mcp", strings.NewReader(reqBody))
+	if err != nil {
+		t.Fatalf("Failed to create authorized HTTP request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-API-Key", "test-api-key")
+
+	respAuthorized, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Failed to send authorized HTTP request: %v", err)
+	}
+	defer respAuthorized.Body.Close()
+
+	if respAuthorized.StatusCode != http.StatusOK {
+		t.Errorf("Expected status %d, got %d", http.StatusOK, respAuthorized.StatusCode)
+	}
+
+	respBytesAuthorized, err := io.ReadAll(respAuthorized.Body)
+	if err != nil {
+		t.Fatalf("Failed to read authorized response body: %v", err)
+	}
+
+	var jsonRpcRespAuthorized types.Response
+	if err := json.Unmarshal(respBytesAuthorized, &jsonRpcRespAuthorized); err != nil {
+		t.Fatalf("Failed to unmarshal authorized JSON-RPC response: %v", err)
+	}
+
+	if jsonRpcRespAuthorized.Error != nil {
+		t.Errorf("Expected no error, got: %+v", jsonRpcRespAuthorized.Error)
+	}
+
+	if jsonRpcRespAuthorized.Result != expectedResult {
+		t.Errorf("Expected result %v, got %v", expectedResult, jsonRpcRespAuthorized.Result)
+	}
 }

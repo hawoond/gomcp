@@ -12,8 +12,10 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/go-playground/validator/v10"
 	"github.com/hawoond/gomcp/internal/types"
 	"github.com/hawoond/gomcp/internal/util"
+	"go.uber.org/zap"
 )
 
 type Resource struct {
@@ -24,19 +26,21 @@ type Resource struct {
 }
 
 type Tool struct {
-	Name        string
-	Description string
-	Func        reflect.Value
-	ParamTypes  []reflect.Type
-	ParamNames  []string
+	Name            string
+	Description     string
+	Func            reflect.Value
+	ParamTypes      []reflect.Type
+	ParamNames      []string
+	ParamStructType reflect.Type
 }
 
 type Prompt struct {
-	Name        string
-	Description string
-	Func        reflect.Value
-	ParamTypes  []reflect.Type
-	ParamNames  []string
+	Name            string
+	Description     string
+	Func            reflect.Value
+	ParamTypes      []reflect.Type
+	ParamNames      []string
+	ParamStructType reflect.Type
 }
 
 type Server struct {
@@ -47,19 +51,31 @@ type Server struct {
 	prompts      map[string]Prompt
 	mu           sync.Mutex
 	shuttingDown bool
+	validator    *validator.Validate
+	rwMu         sync.RWMutex
+	logger       *zap.Logger
+	EnableAuth   bool
+	APIKey       string
 }
 
-func NewServer(name string, version string) *Server {
+func NewServer(name string, version string, enableAuth bool, apiKey string) *Server {
+	logger, _ := zap.NewDevelopment()
 	return &Server{
 		Name:      name,
 		Version:   version,
 		resources: []Resource{},
 		tools:     make(map[string]Tool),
 		prompts:   make(map[string]Prompt),
+		validator: validator.New(),
+		logger:    logger,
+		EnableAuth: enableAuth,
+		APIKey:     apiKey,
 	}
 }
 
 func (s *Server) AddResource(uriTemplate string, description string, handler interface{}) error {
+	s.rwMu.Lock()
+	defer s.rwMu.Unlock()
 	fnVal := reflect.ValueOf(handler)
 	fnType := fnVal.Type()
 	if fnType.Kind() != reflect.Func {
@@ -77,11 +93,13 @@ func (s *Server) AddResource(uriTemplate string, description string, handler int
 		ParamCount:  paramCount,
 	}
 	s.resources = append(s.resources, res)
-	log.Printf("Resource registered: %s", uriTemplate)
+	s.logger.Info("Resource registered", zap.String("uriTemplate", uriTemplate))
 	return nil
 }
 
-func (s *Server) AddTool(name string, description string, handler interface{}) error {
+func (s *Server) AddTool(name string, description string, handler interface{}, paramStruct interface{}, paramNames ...string) error {
+	s.rwMu.Lock()
+	defer s.rwMu.Unlock()
 	fnVal := reflect.ValueOf(handler)
 	fnType := fnVal.Type()
 	if fnType.Kind() != reflect.Func {
@@ -92,40 +110,76 @@ func (s *Server) AddTool(name string, description string, handler interface{}) e
 	if outCount > 2 {
 		return fmt.Errorf("tool %s: too many return values", name)
 	}
-	paramNames := []string{}
-	for i := 0; i < paramCount; i++ {
-		paramNames = append(paramNames, fmt.Sprintf("param%d", i+1))
+	var paramStructType reflect.Type
+	if paramStruct != nil {
+		paramStructType = reflect.TypeOf(paramStruct)
+		if paramStructType.Kind() != reflect.Struct {
+			return fmt.Errorf("paramStruct for tool %s must be a struct type", name)
+		}
+	}
+
+	var finalParamNames []string
+	if len(paramNames) > 0 {
+		finalParamNames = paramNames
+	} else {
+		finalParamNames = make([]string, paramCount)
+		for i := 0; i < paramCount; i++ {
+			finalParamNames[i] = fmt.Sprintf("param%d", i+1)
+		}
+	}
+	if len(finalParamNames) != paramCount {
+		return fmt.Errorf("tool %s: number of provided paramNames (%d) != function parameters (%d)", name, len(finalParamNames), paramCount)
 	}
 	s.tools[name] = Tool{
-		Name:        name,
-		Description: description,
-		Func:        fnVal,
-		ParamTypes:  util.FuncParamTypes(fnType),
-		ParamNames:  paramNames,
+		Name:            name,
+		Description:     description,
+		Func:            fnVal,
+		ParamTypes:      util.FuncParamTypes(fnType),
+		ParamNames:      finalParamNames,
+		ParamStructType: paramStructType,
 	}
-	log.Printf("Tool registered: %s", name)
+	s.logger.Info("Tool registered", zap.String("name", name))
 	return nil
 }
 
-func (s *Server) AddPrompt(name string, description string, handler interface{}) error {
+func (s *Server) AddPrompt(name string, description string, handler interface{}, paramStruct interface{}, paramNames ...string) error {
+	s.rwMu.Lock()
+	defer s.rwMu.Unlock()
 	fnVal := reflect.ValueOf(handler)
 	fnType := fnVal.Type()
 	if fnType.Kind() != reflect.Func {
 		return fmt.Errorf("handler for prompt %s is not a function", name)
 	}
 	paramCount := fnType.NumIn()
-	paramNames := []string{}
-	for i := 0; i < paramCount; i++ {
-		paramNames = append(paramNames, fmt.Sprintf("param%d", i+1))
+	var paramStructType reflect.Type
+	if paramStruct != nil {
+		paramStructType = reflect.TypeOf(paramStruct)
+		if paramStructType.Kind() != reflect.Struct {
+			return fmt.Errorf("paramStruct for prompt %s must be a struct type", name)
+		}
+	}
+
+	var finalParamNames []string
+	if len(paramNames) > 0 {
+		finalParamNames = paramNames
+	} else {
+		finalParamNames = make([]string, paramCount)
+		for i := 0; i < paramCount; i++ {
+			finalParamNames[i] = fmt.Sprintf("param%d", i+1)
+		}
+	}
+	if len(finalParamNames) != paramCount {
+		return fmt.Errorf("prompt %s: number of provided paramNames (%d) != function parameters (%d)", name, len(finalParamNames), paramCount)
 	}
 	s.prompts[name] = Prompt{
-		Name:        name,
-		Description: description,
-		Func:        fnVal,
-		ParamTypes:  util.FuncParamTypes(fnType),
-		ParamNames:  paramNames,
+		Name:            name,
+		Description:     description,
+		Func:            fnVal,
+		ParamTypes:      util.FuncParamTypes(fnType),
+		ParamNames:      finalParamNames,
+		ParamStructType: paramStructType,
 	}
-	log.Printf("Prompt registered: %s", name)
+	s.logger.Info("Prompt registered", zap.String("name", name))
 	return nil
 }
 
@@ -135,7 +189,7 @@ func (s *Server) RunStdio() error {
 	signal.Notify(sigCh, os.Interrupt)
 	go func() {
 		<-sigCh
-		log.Println("Shutdown signal received - shutting down server...")
+		s.logger.Info("Shutdown signal received - shutting down server...")
 		s.shuttingDown = true
 		os.Exit(0)
 	}()
@@ -163,7 +217,26 @@ func (s *Server) RunStdio() error {
 
 func (s *Server) ListenAndServe(addr string) error {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/mcp", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/mcp", s.authMiddleware(s.handleMcpRequest()))
+	s.logger.Info("Starting MCP server with HTTP SSE", zap.String("addr", addr))
+	return http.ListenAndServe(addr, mux)
+}
+
+func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.EnableAuth {
+			apiKey := r.Header.Get("X-API-Key")
+			if apiKey == "" || apiKey != s.APIKey {
+				http.Error(w, "Unauthorized", http.StatusUnauthorized)
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	}
+}
+
+func (s *Server) handleMcpRequest() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Invalid method", http.StatusMethodNotAllowed)
 			return
@@ -206,9 +279,7 @@ func (s *Server) ListenAndServe(addr string) error {
 			enc := json.NewEncoder(w)
 			_ = enc.Encode(out)
 		}
-	})
-	log.Printf("Starting MCP server with HTTP SSE (listening on %s)...", addr)
-	return http.ListenAndServe(addr, mux)
+	}
 }
 
 func (s *Server) handleMessage(raw json.RawMessage) []types.Response {
@@ -246,7 +317,7 @@ func (s *Server) handleMessage(raw json.RawMessage) []types.Response {
 func (s *Server) processRequest(req *types.Request) []types.Response {
 	if req.ID == nil {
 		if req.Method == "notifications/initialized" {
-			log.Printf("Received client initialization complete signal")
+			s.logger.Info("Received client initialization complete signal")
 			return []types.Response{}
 		}
 		_, _ = s.routeMethod(req, nil)
@@ -276,7 +347,7 @@ func (s *Server) routeMethod(req *types.Request, respErrPtr **types.ResponseErro
 			Capabilities    map[string]interface{} `json:"capabilities"`
 		}
 		_ = json.Unmarshal(req.Params, &params)
-		log.Printf("Processing initialize request: client=%v, version=%s", params.ClientInfo, params.ProtocolVersion)
+		s.logger.Info("Processing initialize request", zap.Any("client", params.ClientInfo), zap.String("protocolVersion", params.ProtocolVersion))
 		serverCaps := map[string]interface{}{}
 		if len(s.tools) > 0 {
 			serverCaps["tools"] = map[string]interface{}{}
@@ -298,6 +369,8 @@ func (s *Server) routeMethod(req *types.Request, respErrPtr **types.ResponseErro
 		return result, nil
 
 	case "tools/list":
+		s.rwMu.RLock()
+		defer s.rwMu.RUnlock()
 		toolsList := []map[string]interface{}{}
 		for name, tool := range s.tools {
 			propMap := map[string]interface{}{}
@@ -335,6 +408,8 @@ func (s *Server) routeMethod(req *types.Request, respErrPtr **types.ResponseErro
 		return result, nil
 
 	case "tools/call":
+		s.rwMu.RLock()
+		defer s.rwMu.RUnlock()
 		var params struct {
 			Name      string                 `json:"name"`
 			Arguments map[string]interface{} `json:"arguments"`
@@ -348,6 +423,19 @@ func (s *Server) routeMethod(req *types.Request, respErrPtr **types.ResponseErro
 			*respErrPtr = s.newError(types.CodeMethodNotFound, "Tool not found", nil)
 			return nil, errors.New("tool not found")
 		}
+
+		if tool.ParamStructType != nil {
+			paramInstance := reflect.New(tool.ParamStructType).Interface()
+			jsonParams, _ := json.Marshal(params.Arguments)
+			if err := json.Unmarshal(jsonParams, paramInstance); err != nil {
+				*respErrPtr = s.newError(types.CodeInvalidParams, "Invalid params: "+err.Error(), nil)
+				return nil, err
+			}
+			if err := s.validator.Struct(paramInstance); err != nil {
+				*respErrPtr = s.newError(types.CodeInvalidParams, "Validation error: "+err.Error(), nil)
+				return nil, err
+			}
+		}
 		args, err := s.prepareFuncArgs(tool.ParamTypes, params.Arguments, tool.ParamNames)
 		if err != nil {
 			*respErrPtr = s.newError(types.CodeInvalidParams, "Invalid params: "+err.Error(), nil)
@@ -357,6 +445,8 @@ func (s *Server) routeMethod(req *types.Request, respErrPtr **types.ResponseErro
 		return s.handleFunctionOutputs(outVals, respErrPtr)
 
 	case "resources/list":
+		s.rwMu.RLock()
+		defer s.rwMu.RUnlock()
 		resourcesList := []map[string]interface{}{}
 		for _, res := range s.resources {
 			resourcesList = append(resourcesList, map[string]interface{}{
@@ -370,6 +460,8 @@ func (s *Server) routeMethod(req *types.Request, respErrPtr **types.ResponseErro
 		return result, nil
 
 	case "resources/read":
+		s.rwMu.RLock()
+		defer s.rwMu.RUnlock()
 		var params struct {
 			URI string `json:"uri"`
 		}
@@ -403,6 +495,8 @@ func (s *Server) routeMethod(req *types.Request, respErrPtr **types.ResponseErro
 		return nil, errors.New("resource not found")
 
 	case "prompts/list":
+		s.rwMu.RLock()
+		defer s.rwMu.RUnlock()
 		promptsList := []map[string]interface{}{}
 		for _, prompt := range s.prompts {
 			promptsList = append(promptsList, map[string]interface{}{
@@ -416,6 +510,8 @@ func (s *Server) routeMethod(req *types.Request, respErrPtr **types.ResponseErro
 		return result, nil
 
 	case "prompts/get":
+		s.rwMu.RLock()
+		defer s.rwMu.RUnlock()
 		var params struct {
 			Name      string                 `json:"name"`
 			Arguments map[string]interface{} `json:"arguments"`
@@ -428,6 +524,35 @@ func (s *Server) routeMethod(req *types.Request, respErrPtr **types.ResponseErro
 		if !ok {
 			*respErrPtr = s.newError(types.CodeMethodNotFound, "Prompt not found", nil)
 			return nil, errors.New("prompt not found")
+		}
+		if prompt.ParamStructType != nil {
+			paramInstance := reflect.New(prompt.ParamStructType).Interface()
+			jsonParams, _ := json.Marshal(params.Arguments)
+			if err := json.Unmarshal(jsonParams, paramInstance); err != nil {
+				*respErrPtr = s.newError(types.CodeInvalidParams, "Invalid params: "+err.Error(), nil)
+				return nil, err
+			}
+			if err := s.validator.Struct(paramInstance); err != nil {
+				*respErrPtr = s.newError(types.CodeInvalidParams, "Validation error: "+err.Error(), nil)
+				return nil, err
+			}
+		}
+		if !ok {
+			*respErrPtr = s.newError(types.CodeMethodNotFound, "Prompt not found", nil)
+			return nil, errors.New("prompt not found")
+		}
+
+		if prompt.ParamStructType != nil {
+			paramInstance := reflect.New(prompt.ParamStructType).Interface()
+			jsonParams, _ := json.Marshal(params.Arguments)
+			if err := json.Unmarshal(jsonParams, paramInstance); err != nil {
+				*respErrPtr = s.newError(types.CodeInvalidParams, "Invalid params: "+err.Error(), nil)
+				return nil, err
+			}
+			if err := s.validator.Struct(paramInstance); err != nil {
+				*respErrPtr = s.newError(types.CodeInvalidParams, "Validation error: "+err.Error(), nil)
+				return nil, err
+			}
 		}
 		args, err := s.prepareFuncArgs(prompt.ParamTypes, params.Arguments, prompt.ParamNames)
 		if err != nil {
@@ -532,7 +657,12 @@ func (s *Server) handleFunctionOutputs(outVals []reflect.Value, respErrPtr **typ
 	}
 	if errVal != nil {
 		if respErrPtr != nil {
-			*respErrPtr = s.newError(types.CodeServerError, errVal.Error(), nil)
+			var customErr *types.CustomError
+			if errors.As(errVal, &customErr) {
+				*respErrPtr = s.newError(customErr.Code, customErr.Message, customErr.Data)
+			} else {
+				*respErrPtr = s.newError(types.CodeServerError, errVal.Error(), nil)
+			}
 		}
 		return nil, errVal
 	}
