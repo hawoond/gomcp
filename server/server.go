@@ -1,16 +1,18 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"io"
 	"net/http"
 	"os"
 	"os/signal"
 	"reflect"
 	"strings"
 	"sync"
+	"syscall"
 
 	"github.com/go-playground/validator/v10"
 	"github.com/hawoond/gomcp/internal/types"
@@ -61,13 +63,13 @@ type Server struct {
 func NewServer(name string, version string, enableAuth bool, apiKey string) *Server {
 	logger, _ := zap.NewDevelopment()
 	return &Server{
-		Name:      name,
-		Version:   version,
-		resources: []Resource{},
-		tools:     make(map[string]Tool),
-		prompts:   make(map[string]Prompt),
-		validator: validator.New(),
-		logger:    logger,
+		Name:       name,
+		Version:    version,
+		resources:  []Resource{},
+		tools:      make(map[string]Tool),
+		prompts:    make(map[string]Prompt),
+		validator:  validator.New(),
+		logger:     logger,
 		EnableAuth: enableAuth,
 		APIKey:     apiKey,
 	}
@@ -184,33 +186,42 @@ func (s *Server) AddPrompt(name string, description string, handler interface{},
 }
 
 func (s *Server) RunStdio() error {
-	log.Printf("Starting MCP server via STDIO: %s (v%s)", s.Name, s.Version)
+	s.logger.Info("Starting MCP server via STDIO", zap.String("name", s.Name), zap.String("version", s.Version))
+
+	ctx, cancel := context.WithCancel(context.Background())
 	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+
 	go func() {
 		<-sigCh
 		s.logger.Info("Shutdown signal received - shutting down server...")
 		s.shuttingDown = true
-		os.Exit(0)
+		cancel() // Signal context cancellation
 	}()
+
 	decoder := json.NewDecoder(os.Stdin)
 	encoder := json.NewEncoder(os.Stdout)
+
 	for {
-		var raw json.RawMessage
-		if err := decoder.Decode(&raw); err != nil {
-			if errors.Is(err, os.ErrClosed) || s.shuttingDown {
-				return nil
+		select {
+		case <-ctx.Done():
+			s.logger.Info("Server context cancelled, exiting STDIO loop.")
+			return nil
+		default:
+			var raw json.RawMessage
+			if err := decoder.Decode(&raw); err != nil {
+				if errors.Is(err, io.EOF) || errors.Is(err, os.ErrClosed) || s.shuttingDown {
+					s.logger.Info("STDIO input closed or server shutting down.")
+					return nil
+				}
+				respErr := s.makeErrorResponse(nil, types.CodeParseError, "Parse error", nil)
+				_ = encoder.Encode(respErr)
+				continue
 			}
-			if err.Error() == "EOF" {
-				return nil
+			responses := s.handleMessage(raw)
+			for _, resp := range responses {
+				_ = encoder.Encode(resp)
 			}
-			respErr := s.makeErrorResponse(nil, types.CodeParseError, "Parse error", nil)
-			_ = encoder.Encode(respErr)
-			continue
-		}
-		responses := s.handleMessage(raw)
-		for _, resp := range responses {
-			_ = encoder.Encode(resp)
 		}
 	}
 }
@@ -218,6 +229,7 @@ func (s *Server) RunStdio() error {
 func (s *Server) ListenAndServe(addr string) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/mcp", s.authMiddleware(s.handleMcpRequest()))
+	mux.HandleFunc("/health", s.healthCheckHandler())
 	s.logger.Info("Starting MCP server with HTTP SSE", zap.String("addr", addr))
 	return http.ListenAndServe(addr, mux)
 }
@@ -684,4 +696,11 @@ func (s *Server) prepareFuncArgs(paramTypes []reflect.Type, argsMap map[string]i
 		args = append(args, argVal)
 	}
 	return args, nil
+}
+
+func (s *Server) healthCheckHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("OK"))
+	}
 }
