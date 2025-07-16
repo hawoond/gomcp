@@ -1,11 +1,14 @@
 package client
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os/exec"
+	"strings"
 	"sync"
 
 	"github.com/hawoond/gomcp/internal/types"
@@ -164,4 +167,87 @@ func (c *Client) Call(method string, params interface{}, result interface{}) err
 		_ = json.Unmarshal(resBytes, result)
 	}
 	return nil
+}
+
+func (c *Client) CallAsync(toolName string, arguments map[string]interface{}) (string, error) {
+	params := map[string]interface{}{
+		"name":      toolName,
+		"arguments": arguments,
+	}
+	var result struct {
+		TaskID string `json:"taskId"`
+	}
+	if err := c.Call("tools/call_async", params, &result); err != nil {
+		return "", err
+	}
+	return result.TaskID, nil
+}
+
+func (c *Client) GetResult(taskID string) (*types.Task, error) {
+	params := map[string]interface{}{
+		"taskId": taskID,
+	}
+	var result types.Task
+	if err := c.Call("tools/get_result", params, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+func (c *Client) CallStream(method string, params interface{}) (<-chan types.Response, error) {
+	if c.transport != "http" {
+		return nil, fmt.Errorf("streaming is only supported over HTTP")
+	}
+
+	c.mu.Lock()
+	id := c.nextID
+	c.nextID++
+	c.mu.Unlock()
+
+	reqObj := types.Request{
+		JSONRPC: "2.0",
+		Method:  method,
+	}
+	idBytes, _ := json.Marshal(id)
+	rawID := json.RawMessage(idBytes)
+	reqObj.ID = &rawID
+	if params != nil {
+		paramBytes, _ := json.Marshal(params)
+		reqObj.Params = json.RawMessage(paramBytes)
+	}
+	reqBytes, _ := json.Marshal(reqObj)
+
+	url := c.baseURL + "/mcp"
+	req, err := http.NewRequest("POST", url, bytes.NewReader(reqBytes))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/event-stream")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+
+	ch := make(chan types.Response)
+
+	go func() {
+		defer resp.Body.Close()
+		defer close(ch)
+
+		scanner := bufio.NewScanner(resp.Body)
+		for scanner.Scan() {
+			line := scanner.Text()
+			if strings.HasPrefix(line, "data: ") {
+				data := strings.TrimPrefix(line, "data: ")
+				var respObj types.Response
+				if err := json.Unmarshal([]byte(data), &respObj); err == nil {
+					ch <- respObj
+				}
+			}
+		}
+	}()
+
+	return ch, nil
 }

@@ -15,6 +15,7 @@ import (
 	"syscall"
 
 	"github.com/go-playground/validator/v10"
+	"github.com/google/uuid"
 	"github.com/hawoond/gomcp/internal/types"
 	"github.com/hawoond/gomcp/internal/util"
 	"go.uber.org/zap"
@@ -51,6 +52,8 @@ type Server struct {
 	resources    []Resource
 	tools        map[string]Tool
 	prompts      map[string]Prompt
+	tasks        map[string]*types.Task
+	tasksMu      sync.RWMutex
 	mu           sync.Mutex
 	shuttingDown bool
 	validator    *validator.Validate
@@ -68,6 +71,7 @@ func NewServer(name string, version string, enableAuth bool, apiKey string) *Ser
 		resources:  []Resource{},
 		tools:      make(map[string]Tool),
 		prompts:    make(map[string]Prompt),
+		tasks:      make(map[string]*types.Task),
 		validator:  validator.New(),
 		logger:     logger,
 		EnableAuth: enableAuth,
@@ -267,6 +271,28 @@ func (s *Server) handleMcpRequest() http.HandlerFunc {
 			}
 			return
 		}
+
+		var req types.Request
+		isStream := false
+		if wantsSSE {
+			if err := json.Unmarshal(raw, &req); err == nil {
+				if req.Method == "tools/call_stream" || req.Method == "prompts/get_stream" {
+					isStream = true
+				}
+			}
+		}
+
+		if isStream {
+			w.Header().Set("Content-Type", "text/event-stream")
+			flusher, ok := w.(http.Flusher)
+			if !ok {
+				http.Error(w, "Streaming unsupported", http.StatusInternalServerError)
+				return
+			}
+			s.handleStreamRequest(&req, w, flusher)
+			return
+		}
+
 		responses := s.handleMessage(raw)
 		if wantsSSE {
 			w.Header().Set("Content-Type", "text/event-stream")
@@ -455,6 +481,96 @@ func (s *Server) routeMethod(req *types.Request, respErrPtr **types.ResponseErro
 		}
 		outVals := tool.Func.Call(args)
 		return s.handleFunctionOutputs(outVals, respErrPtr)
+
+	case "tools/call_async":
+		s.rwMu.RLock()
+		defer s.rwMu.RUnlock()
+		var params struct {
+			Name      string                 `json:"name"`
+			Arguments map[string]interface{} `json:"arguments"`
+		}
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			*respErrPtr = s.newError(types.CodeInvalidParams, "Invalid params", nil)
+			return nil, errors.New("param parse error")
+		}
+		tool, ok := s.tools[params.Name]
+		if !ok {
+			*respErrPtr = s.newError(types.CodeMethodNotFound, "Tool not found", nil)
+			return nil, errors.New("tool not found")
+		}
+
+		taskID := uuid.New().String()
+		task := &types.Task{ID: taskID, Status: types.TaskStatusRunning}
+		s.tasksMu.Lock()
+		s.tasks[taskID] = task
+		s.tasksMu.Unlock()
+
+		go func() {
+			args, err := s.prepareFuncArgs(tool.ParamTypes, params.Arguments, tool.ParamNames)
+			if err != nil {
+				task.Status = types.TaskStatusFailed
+				task.Error = s.newError(types.CodeInvalidParams, "Invalid params: "+err.Error(), nil)
+				return
+			}
+
+			outVals := tool.Func.Call(args)
+			result, err := s.handleFunctionOutputs(outVals, &task.Error)
+
+			s.tasksMu.Lock()
+			defer s.tasksMu.Unlock()
+			if err != nil {
+				task.Status = types.TaskStatusFailed
+			} else {
+				task.Status = types.TaskStatusCompleted
+				task.Result = result
+			}
+		}()
+
+		return map[string]interface{}{"taskId": taskID}, nil
+
+	case "tools/get_result":
+		s.tasksMu.RLock()
+		defer s.tasksMu.RUnlock()
+		var params struct {
+			TaskID string `json:"taskId"`
+		}
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			*respErrPtr = s.newError(types.CodeInvalidParams, "Invalid params", nil)
+			return nil, errors.New("param parse error")
+		}
+		task, ok := s.tasks[params.TaskID]
+		if !ok {
+			*respErrPtr = s.newError(types.CodeMethodNotFound, "Task not found", nil)
+			return nil, errors.New("task not found")
+		}
+		return task, nil
+
+	case "tools/call_stream":
+		s.rwMu.RLock()
+		defer s.rwMu.RUnlock()
+		var params struct {
+			Name      string                 `json:"name"`
+			Arguments map[string]interface{} `json:"arguments"`
+		}
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			*respErrPtr = s.newError(types.CodeInvalidParams, "Invalid params", nil)
+			return nil, errors.New("param parse error")
+		}
+		tool, ok := s.tools[params.Name]
+		if !ok {
+			*respErrPtr = s.newError(types.CodeMethodNotFound, "Tool not found", nil)
+			return nil, errors.New("tool not found")
+		}
+
+		args, err := s.prepareFuncArgs(tool.ParamTypes, params.Arguments, tool.ParamNames)
+		if err != nil {
+			*respErrPtr = s.newError(types.CodeInvalidParams, "Invalid params: "+err.Error(), nil)
+			return nil, err
+		}
+
+		outVals := tool.Func.Call(args)
+		return s.handleFunctionOutputs(outVals, respErrPtr)
+
 
 	case "resources/list":
 		s.rwMu.RLock()
@@ -702,5 +818,48 @@ func (s *Server) healthCheckHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("OK"))
+	}
+}
+
+func (s *Server) handleStreamRequest(req *types.Request, w http.ResponseWriter, flusher http.Flusher) {
+	var respErr *types.ResponseError
+	result, err := s.routeMethod(req, &respErr)
+
+	if err != nil {
+		resp := s.makeErrorResponse(req.ID, respErr.Code, respErr.Message, respErr.Data)
+		data, _ := json.Marshal(resp)
+		fmt.Fprintf(w, "data: %s\n\n", data)
+		flusher.Flush()
+		return
+	}
+
+	// Check if the result is a channel
+	val := reflect.ValueOf(result)
+	if val.Kind() != reflect.Chan {
+		// Not a streaming response, just send the single result
+		resp := types.Response{ID: req.ID, JSONRPC: "2.0", Result: result}
+		data, _ := json.Marshal(resp)
+		fmt.Fprintf(w, "data: %s\n\n", data)
+		flusher.Flush()
+		return
+	}
+
+	// It's a streaming response, listen on the channel
+	for {
+		item, ok := val.Recv()
+		if !ok {
+			// Channel closed, we are done.
+			break
+		}
+
+		// Create a partial response
+		partialResp := types.Response{
+			ID:      req.ID,
+			JSONRPC: "2.0",
+			Result:  item.Interface(),
+		}
+		data, _ := json.Marshal(partialResp)
+		fmt.Fprintf(w, "data: %s\n\n", data)
+		flusher.Flush()
 	}
 }

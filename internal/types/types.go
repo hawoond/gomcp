@@ -34,10 +34,11 @@ type ResponseError struct {
 }
 
 type Content struct {
-	Type     string `json:"type"`
-	Text     string `json:"text,omitempty"`
-	Data     string `json:"data,omitempty"`
-	MimeType string `json:"mimeType,omitempty"`
+	Type      string `json:"type"`
+	Text      string `json:"text,omitempty"`
+	Data      string `json:"data,omitempty"`
+	MimeType  string `json:"mimeType,omitempty"`
+	IsPartial bool   `json:"isPartial,omitempty"`
 }
 
 type Message struct {
@@ -64,4 +65,19 @@ func NewCustomError(code int, message string, data interface{}) *CustomError {
 		Message: message,
 		Data:    data,
 	}
+}
+
+type TaskStatus string
+
+const (
+	TaskStatusRunning   TaskStatus = "running"
+	TaskStatusCompleted TaskStatus = "completed"
+	TaskStatusFailed    TaskStatus = "failed"
+)
+
+type Task struct {
+	ID     string      `json:"id"`
+	Status TaskStatus  `json:"status"`
+	Result interface{} `json:"result,omitempty"`
+	Error  *ResponseError `json:"error,omitempty"`
 }

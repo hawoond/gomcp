@@ -28,7 +28,7 @@ func TestHTTPTransport(t *testing.T) {
 	defer ts.Close()
 
 	// Simulate a tools/call request over HTTP
-	reqBody := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"add","arguments":{"A":10,"B":20}}}`
+	reqBody := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"add","arguments":{"a":10,"b":20}}}`
 	resp, err := http.Post(ts.URL+"/mcp", "application/json", strings.NewReader(reqBody))
 	if err != nil {
 		t.Fatalf("Failed to send HTTP request: %v", err)
