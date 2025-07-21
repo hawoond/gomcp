@@ -11,6 +11,9 @@ const (
 	CodeInvalidParams  = -32602
 	CodeInternalError  = -32603
 	CodeServerError    = -32000
+
+	// Custom MCP-specific error codes
+	CodeVersionMismatch = -32001
 )
 
 type Request struct {

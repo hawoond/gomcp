@@ -47,35 +47,43 @@ type Prompt struct {
 }
 
 type Server struct {
-	Name         string
-	Version      string
-	resources    []Resource
-	tools        map[string]Tool
-	prompts      map[string]Prompt
-	tasks        map[string]*types.Task
-	tasksMu      sync.RWMutex
-	mu           sync.Mutex
-	shuttingDown bool
-	validator    *validator.Validate
-	rwMu         sync.RWMutex
-	logger       *zap.Logger
-	EnableAuth   bool
-	APIKey       string
+	Name                      string
+	Version                   string
+	SupportedProtocolVersions []string
+	resources                 []Resource
+	tools                     map[string]Tool
+	prompts                   map[string]Prompt
+	tasks                     map[string]*types.Task
+	tasksMu                   sync.RWMutex
+	mu                        sync.Mutex
+	shuttingDown              bool
+	validator                 *validator.Validate
+	rwMu                      sync.RWMutex
+	logger                    *zap.Logger
+	EnableAuth                bool
+	APIKey                    string
+	eventSubscribers          map[chan []byte]bool
+	subscribersMu             sync.RWMutex
 }
 
-func NewServer(name string, version string, enableAuth bool, apiKey string) *Server {
+func NewServer(name string, version string, enableAuth bool, apiKey string, supportedVersions ...string) *Server {
 	logger, _ := zap.NewDevelopment()
+	if len(supportedVersions) == 0 {
+		supportedVersions = []string{"2024-11-05"} // Default version
+	}
 	return &Server{
-		Name:       name,
-		Version:    version,
-		resources:  []Resource{},
-		tools:      make(map[string]Tool),
-		prompts:    make(map[string]Prompt),
-		tasks:      make(map[string]*types.Task),
-		validator:  validator.New(),
-		logger:     logger,
-		EnableAuth: enableAuth,
-		APIKey:     apiKey,
+		Name:                      name,
+		Version:                   version,
+		SupportedProtocolVersions: supportedVersions,
+		resources:                 []Resource{},
+		tools:                     make(map[string]Tool),
+		prompts:                   make(map[string]Prompt),
+		tasks:                     make(map[string]*types.Task),
+		validator:                 validator.New(),
+		logger:                    logger,
+		EnableAuth:                enableAuth,
+		APIKey:                    apiKey,
+		eventSubscribers:          make(map[chan []byte]bool),
 	}
 }
 
@@ -305,13 +313,30 @@ func (s *Server) handleMcpRequest() http.HandlerFunc {
 				data, _ := json.Marshal(resp)
 				fmt.Fprintf(w, "data: %s\n\n", data)
 				flusher.Flush()
-			}
-		} else {
-			var out interface{}
-			if len(responses) == 1 {
-				out = responses[0]
-			} else {
-				out = responses
+            }
+
+            // Keep the connection open for notifications
+            notificationChan := make(chan []byte)
+            s.addSubscriber(notificationChan)
+            defer s.removeSubscriber(notificationChan)
+
+            ctx := r.Context()
+            for {
+                select {
+                case notification := <-notificationChan:
+                    fmt.Fprintf(w, "data: %s\n\n", notification)
+                    flusher.Flush()
+                case <-ctx.Done():
+                    return // Client disconnected
+                }
+            }
+
+        } else {
+            var out interface{}
+            if len(responses) == 1 {
+                out = responses[0]
+            } else {
+                out = responses
 			}
 			w.Header().Set("Content-Type", "application/json")
 			enc := json.NewEncoder(w)
@@ -385,6 +410,25 @@ func (s *Server) routeMethod(req *types.Request, respErrPtr **types.ResponseErro
 			Capabilities    map[string]interface{} `json:"capabilities"`
 		}
 		_ = json.Unmarshal(req.Params, &params)
+
+		// Version negotiation
+		clientVersion := params.ProtocolVersion
+		versionSupported := false
+		for _, v := range s.SupportedProtocolVersions {
+			if v == clientVersion {
+				versionSupported = true
+				break
+			}
+		}
+
+		if !versionSupported {
+			errData := map[string]interface{}{
+				"supportedVersions": s.SupportedProtocolVersions,
+			}
+			*respErrPtr = s.newError(types.CodeVersionMismatch, "Unsupported protocol version", errData)
+			return nil, errors.New("version mismatch")
+		}
+
 		s.logger.Info("Processing initialize request", zap.Any("client", params.ClientInfo), zap.String("protocolVersion", params.ProtocolVersion))
 		serverCaps := map[string]interface{}{}
 		if len(s.tools) > 0 {
@@ -505,7 +549,15 @@ func (s *Server) routeMethod(req *types.Request, respErrPtr **types.ResponseErro
 		s.tasks[taskID] = task
 		s.tasksMu.Unlock()
 
+		s.PublishNotification("events/taskStatusChanged", task)
+
 		go func() {
+			defer func() {
+				s.tasksMu.Lock()
+				defer s.tasksMu.Unlock()
+				s.PublishNotification("events/taskStatusChanged", task)
+			}()
+
 			args, err := s.prepareFuncArgs(tool.ParamTypes, params.Arguments, tool.ParamNames)
 			if err != nil {
 				task.Status = types.TaskStatusFailed
@@ -571,6 +623,31 @@ func (s *Server) routeMethod(req *types.Request, respErrPtr **types.ResponseErro
 		outVals := tool.Func.Call(args)
 		return s.handleFunctionOutputs(outVals, respErrPtr)
 
+	case "prompts/get_stream":
+		s.rwMu.RLock()
+		defer s.rwMu.RUnlock()
+		var params struct {
+			Name      string                 `json:"name"`
+			Arguments map[string]interface{} `json:"arguments"`
+		}
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			*respErrPtr = s.newError(types.CodeInvalidParams, "Invalid params", nil)
+			return nil, errors.New("param parse error")
+		}
+		prompt, ok := s.prompts[params.Name]
+		if !ok {
+			*respErrPtr = s.newError(types.CodeMethodNotFound, "Prompt not found", nil)
+			return nil, errors.New("prompt not found")
+		}
+
+		args, err := s.prepareFuncArgs(prompt.ParamTypes, params.Arguments, prompt.ParamNames)
+		if err != nil {
+			*respErrPtr = s.newError(types.CodeInvalidParams, "Invalid params: "+err.Error(), nil)
+			return nil, err
+		}
+
+		outVals := prompt.Func.Call(args)
+		return s.handleFunctionOutputs(outVals, respErrPtr)
 
 	case "resources/list":
 		s.rwMu.RLock()
@@ -739,6 +816,69 @@ func (s *Server) routeMethod(req *types.Request, respErrPtr **types.ResponseErro
 		}
 		return result, nil
 
+	case "tools/unregister":
+		s.rwMu.Lock()
+		defer s.rwMu.Unlock()
+		var params struct {
+			Name string `json:"name"`
+		}
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			*respErrPtr = s.newError(types.CodeInvalidParams, "Invalid params", nil)
+			return nil, errors.New("param parse error")
+		}
+		if _, ok := s.tools[params.Name]; !ok {
+			*respErrPtr = s.newError(types.CodeMethodNotFound, "Tool not found", nil)
+			return nil, errors.New("tool not found")
+		}
+		delete(s.tools, params.Name)
+		s.logger.Info("Tool unregistered", zap.String("name", params.Name))
+		return map[string]interface{}{"status": "ok"}, nil
+
+	case "prompts/unregister":
+		s.rwMu.Lock()
+		defer s.rwMu.Unlock()
+		var params struct {
+			Name string `json:"name"`
+		}
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			*respErrPtr = s.newError(types.CodeInvalidParams, "Invalid params", nil)
+			return nil, errors.New("param parse error")
+		}
+		if _, ok := s.prompts[params.Name]; !ok {
+			*respErrPtr = s.newError(types.CodeMethodNotFound, "Prompt not found", nil)
+			return nil, errors.New("prompt not found")
+		}
+		delete(s.prompts, params.Name)
+		s.logger.Info("Prompt unregistered", zap.String("name", params.Name))
+		return map[string]interface{}{"status": "ok"}, nil
+
+	case "resources/unregister":
+		s.rwMu.Lock()
+		defer s.rwMu.Unlock()
+		var params struct {
+			URI string `json:"uri"`
+		}
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			*respErrPtr = s.newError(types.CodeInvalidParams, "Invalid params", nil)
+			return nil, errors.New("param parse error")
+		}
+		found := false
+		var newResources []Resource
+		for _, r := range s.resources {
+			if r.URITemplate == params.URI {
+				found = true
+			} else {
+				newResources = append(newResources, r)
+			}
+		}
+		if !found {
+			*respErrPtr = s.newError(types.CodeMethodNotFound, "Resource not found", nil)
+			return nil, errors.New("resource not found")
+		}
+		s.resources = newResources
+		s.logger.Info("Resource unregistered", zap.String("uri", params.URI))
+		return map[string]interface{}{"status": "ok"}, nil
+
 	default:
 		if respErrPtr != nil {
 			*respErrPtr = s.newError(types.CodeMethodNotFound, "Method not found", nil)
@@ -818,6 +958,45 @@ func (s *Server) healthCheckHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("OK"))
+	}
+}
+
+func (s *Server) addSubscriber(ch chan []byte) {
+	s.subscribersMu.Lock()
+	defer s.subscribersMu.Unlock()
+	s.eventSubscribers[ch] = true
+	s.logger.Info("Added new event subscriber")
+}
+
+func (s *Server) removeSubscriber(ch chan []byte) {
+	s.subscribersMu.Lock()
+	defer s.subscribersMu.Unlock()
+	delete(s.eventSubscribers, ch)
+	close(ch)
+	s.logger.Info("Removed event subscriber")
+}
+
+func (s *Server) PublishNotification(method string, params interface{}) {
+	s.subscribersMu.RLock()
+	defer s.subscribersMu.RUnlock()
+
+	notification := types.Request{
+		JSONRPC: "2.0",
+		Method:  method,
+	}
+	if params != nil {
+		paramBytes, _ := json.Marshal(params)
+		notification.Params = json.RawMessage(paramBytes)
+	}
+	notificationBytes, _ := json.Marshal(notification)
+
+	s.logger.Info("Publishing notification", zap.String("method", method), zap.Int("subscriberCount", len(s.eventSubscribers)))
+	for ch := range s.eventSubscribers {
+		select {
+		case ch <- notificationBytes:
+		default:
+			// Don't block if the channel is full
+		}
 	}
 }
 

@@ -3,6 +3,7 @@ package client
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -15,14 +16,17 @@ import (
 	"github.com/hawoond/gomcp/internal/util"
 )
 
+type NotificationHandler func(method string, params json.RawMessage)
+
 type Client struct {
-	transport string
-	cmd       *exec.Cmd
-	stdin     io.WriteCloser
-	stdout    io.ReadCloser
-	baseURL   string
-	mu        sync.Mutex
-	nextID    int
+	transport           string
+	cmd                 *exec.Cmd
+	stdin               io.WriteCloser
+	stdout              io.ReadCloser
+	baseURL             string
+	mu                  sync.Mutex
+	nextID              int
+	notificationHandler NotificationHandler
 }
 
 func NewClient() *Client {
@@ -72,9 +76,9 @@ func (c *Client) ConnectHTTP(baseURL string) {
 	c.baseURL = baseURL
 }
 
-func (c *Client) Initialize(clientName string, clientVersion string) error {
+func (c *Client) Initialize(clientName string, clientVersion string, protocolVersion string) error {
 	params := map[string]interface{}{
-		"protocolVersion": "2024-11-05",
+		"protocolVersion": protocolVersion,
 		"clientInfo": map[string]string{
 			"name":    clientName,
 			"version": clientVersion,
@@ -102,6 +106,14 @@ func (c *Client) ListPrompts() ([]map[string]interface{}, error) {
 	}
 	err := c.Call("prompts/list", map[string]interface{}{}, &result)
 	return result.Prompts, err
+}
+
+func (c *Client) ListResources() ([]map[string]interface{}, error) {
+	var result struct {
+		Resources []map[string]interface{} `json:"resources"`
+	}
+	err := c.Call("resources/list", map[string]interface{}{}, &result)
+	return result.Resources, err
 }
 
 func (c *Client) Call(method string, params interface{}, result interface{}) error {
@@ -194,6 +206,41 @@ func (c *Client) GetResult(taskID string) (*types.Task, error) {
 	return &result, nil
 }
 
+func (c *Client) HandleNotifications(handler NotificationHandler) {
+	c.notificationHandler = handler
+}
+
+func (c *Client) UnregisterTool(name string) error {
+	params := map[string]interface{}{"name": name}
+	return c.Call("tools/unregister", params, nil)
+}
+
+func (c *Client) UnregisterPrompt(name string) error {
+	params := map[string]interface{}{"name": name}
+	return c.Call("prompts/unregister", params, nil)
+}
+
+func (c *Client) UnregisterResource(uri string) error {
+	params := map[string]interface{}{"uri": uri}
+	return c.Call("resources/unregister", params, nil)
+}
+
+func (c *Client) ToolStream(toolName string, arguments map[string]interface{}) (<-chan types.Response, error) {
+	params := map[string]interface{}{
+		"name":      toolName,
+		"arguments": arguments,
+	}
+	return c.CallStream("tools/call_stream", params)
+}
+
+func (c *Client) PromptStream(promptName string, arguments map[string]interface{}) (<-chan types.Response, error) {
+	params := map[string]interface{}{
+		"name":      promptName,
+		"arguments": arguments,
+	}
+	return c.CallStream("prompts/get_stream", params)
+}
+
 func (c *Client) CallStream(method string, params interface{}) (<-chan types.Response, error) {
 	if c.transport != "http" {
 		return nil, fmt.Errorf("streaming is only supported over HTTP")
@@ -241,6 +288,14 @@ func (c *Client) CallStream(method string, params interface{}) (<-chan types.Res
 			line := scanner.Text()
 			if strings.HasPrefix(line, "data: ") {
 				data := strings.TrimPrefix(line, "data: ")
+				var req types.Request
+				if err := json.Unmarshal([]byte(data), &req); err == nil && req.ID == nil { // It's a notification
+					if c.notificationHandler != nil {
+						c.notificationHandler(req.Method, req.Params)
+					}
+					continue
+				}
+
 				var respObj types.Response
 				if err := json.Unmarshal([]byte(data), &respObj); err == nil {
 					ch <- respObj
@@ -250,4 +305,58 @@ func (c *Client) CallStream(method string, params interface{}) (<-chan types.Res
 	}()
 
 	return ch, nil
+}
+
+func (c *Client) ListenForNotifications(ctx context.Context) (<-chan types.Request, error) {
+	if c.transport != "http" {
+		return nil, fmt.Errorf("notifications are only supported over HTTP")
+	}
+
+	url := c.baseURL + "/mcp"
+	req, err := http.NewRequestWithContext(ctx, "POST", url, strings.NewReader(`{"jsonrpc":"2.0","method":"notifications/initialized"}`)) // Dummy request to establish SSE
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/event-stream")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+
+	notificationCh := make(chan types.Request)
+
+	go func() {
+		defer resp.Body.Close()
+		defer close(notificationCh)
+
+		scanner := bufio.NewScanner(resp.Body)
+		for {
+			select {
+			case <-ctx.Done():
+				resp.Body.Close()
+				return
+			default:
+				if !scanner.Scan() {
+					return // Scanner finished or encountered an error
+				}
+				line := scanner.Text()
+				if strings.HasPrefix(line, "data: ") {
+					data := strings.TrimPrefix(line, "data: ")
+					var notification types.Request
+					if err := json.Unmarshal([]byte(data), &notification); err == nil && notification.ID == nil {
+						select {
+						case notificationCh <- notification:
+						case <-ctx.Done():
+							resp.Body.Close() // Close body explicitly on context done
+							return
+						}
+					}
+				}
+			}
+		}
+	}()
+
+	return notificationCh, nil
 }

@@ -12,7 +12,7 @@ import (
 )
 
 func TestHTTPTransport(t *testing.T) {
-	srv := NewServer("TestApp", "0.1.0", false, "")
+	srv := NewServer("TestApp", "0.1.0", false, "", "2024-11-05")
 	type AddParams struct {
 		A int `validate:"required"`
 		B int `validate:"required"`
@@ -55,7 +55,7 @@ func TestHTTPTransport(t *testing.T) {
 	}
 
 	// Test with authentication enabled
-	srvAuth := NewServer("TestAppAuth", "0.1.0", true, "test-api-key")
+	srvAuth := NewServer("TestAppAuth", "0.1.0", true, "test-api-key", "2024-11-05")
 	srvAuth.AddTool("add", "Adds two integers", func(a int, b int) int {
 		return a + b
 	}, AddParams{}, "a", "b")

@@ -2,6 +2,8 @@ package server
 
 import (
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -10,53 +12,103 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func TestStreamToolCall(t *testing.T) {
-	// Server setup
+func streamTool(name string) chan types.Content {
+	ch := make(chan types.Content)
 	go func() {
-		s := NewServer("test-stream-server", "1.0", false, "")
-		s.AddTool("streaming_tool", "A tool that streams results", func() (<-chan types.Content, error) {
-			ch := make(chan types.Content)
-			go func() {
-				defer close(ch)
-				for i := 0; i < 3; i++ {
-					ch <- types.Content{Type: "text", Text: fmt.Sprintf("Chunk %d", i), IsPartial: true}
-					time.Sleep(50 * time.Millisecond)
-				}
-			}()
-			return ch, nil
-		}, nil)
-		s.ListenAndServe(":8082")
+		defer close(ch)
+		for i := 0; i < 3; i++ {
+			time.Sleep(10 * time.Millisecond)
+			ch <- types.Content{
+				Type:      "text",
+				Text:      fmt.Sprintf("Hello %s, part %d", name, i),
+				IsPartial: true,
+			}
+		}
+	}	()
+	return ch
+}
+
+func streamPrompt(name string) chan types.Message {
+	ch := make(chan types.Message)
+	go func() {
+		defer close(ch)
+		for i := 0; i < 3; i++ {
+			time.Sleep(10 * time.Millisecond)
+			ch <- types.Message{
+				Role: "user",
+				Content: types.Content{
+					Type:      "text",
+					Text:      fmt.Sprintf("Hello %s, part %d", name, i),
+					IsPartial: true,
+				},
+			}
+		}
 	}()
+	return ch
+}
 
-	// Allow server to start
-	time.Sleep(1 * time.Second)
-
-	// Client setup
-	c := client.NewClient()
-	c.ConnectHTTP("http://localhost:8082")
-
-	// Call the tool with streaming
-	params := map[string]interface{}{
-		"name": "streaming_tool",
-	}
-	respCh, err := c.CallStream("tools/call_stream", params)
+func TestStreamTool(t *testing.T) {
+	s := NewServer("test-stream-server", "1.0", false, "")
+	err := s.AddTool("streamer", "A streaming tool", streamTool, nil, "name")
 	assert.NoError(t, err)
-	assert.NotNil(t, respCh)
+
+	httpServer := httptest.NewServer(http.HandlerFunc(s.handleMcpRequest()))
+	defer httpServer.Close()
+
+	c := client.NewClient()
+	c.ConnectHTTP(httpServer.URL)
+
+	args := map[string]interface{}{"name": "Streamy"}
+	respCh, err := c.ToolStream("streamer", args)
+	assert.NoError(t, err)
 
 	var responses []types.Response
 	for resp := range respCh {
 		responses = append(responses, resp)
 	}
 
-	assert.Len(t, responses, 3)
+	assert.Equal(t, 3, len(responses))
 
 	for i, resp := range responses {
 		assert.Nil(t, resp.Error)
 		content, ok := resp.Result.(map[string]interface{})
 		assert.True(t, ok)
 		assert.Equal(t, "text", content["type"])
-		assert.Equal(t, fmt.Sprintf("Chunk %d", i), content["text"])
+		assert.Equal(t, fmt.Sprintf("Hello Streamy, part %d", i), content["text"])
 		assert.Equal(t, true, content["isPartial"])
 	}
 }
 
+func TestStreamPrompt(t *testing.T) {
+	s := NewServer("test-stream-prompt-server", "1.0", false, "")
+	err := s.AddPrompt("streamer", "A streaming prompt", streamPrompt, nil, "name")
+	assert.NoError(t, err)
+
+	httpServer := httptest.NewServer(http.HandlerFunc(s.handleMcpRequest()))
+	defer httpServer.Close()
+
+	c := client.NewClient()
+	c.ConnectHTTP(httpServer.URL)
+
+	args := map[string]interface{}{"name": "Streamy"}
+	respCh, err := c.PromptStream("streamer", args)
+	assert.NoError(t, err)
+
+	var responses []types.Response
+	for resp := range respCh {
+		responses = append(responses, resp)
+	}
+
+	assert.Equal(t, 3, len(responses))
+
+	for i, resp := range responses {
+		assert.Nil(t, resp.Error)
+		msg, ok := resp.Result.(map[string]interface{})
+		assert.True(t, ok)
+		assert.Equal(t, "user", msg["role"])
+		content := msg["content"].(map[string]interface{})
+		assert.Equal(t, "text", content["type"])
+		assert.Equal(t, fmt.Sprintf("Hello Streamy, part %d", i), content["text"])
+		assert.Equal(t, true, content["isPartial"])
+	}
+}
