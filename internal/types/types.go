@@ -79,8 +79,44 @@ const (
 )
 
 type Task struct {
-	ID     string      `json:"id"`
-	Status TaskStatus  `json:"status"`
-	Result interface{} `json:"result,omitempty"`
+	ID     string        `json:"id"`
+	Status TaskStatus    `json:"status"`
+	Result interface{}   `json:"result,omitempty"`
 	Error  *ResponseError `json:"error,omitempty"`
+}
+
+// ToolDefinition defines the structure for dynamically registering a tool.
+type ToolDefinition struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	InputSchema json.RawMessage `json:"inputSchema,omitempty"` // JSON Schema for input parameters
+	Type        string          `json:"type"`                  // "command", "http"
+	Command     *CommandConfig  `json:"command,omitempty"`
+	HTTP        *HTTPConfig     `json:"http,omitempty"`
+}
+
+// CommandConfig defines configuration for executing a shell command.
+type CommandConfig struct {
+	Path string   `json:"path"` // Path to the executable
+	Args []string `json:"args,omitempty"` // Arguments to pass to the command
+	// TODO: Add environment variables, working directory, etc.
+}
+
+// HTTPConfig defines configuration for making an HTTP request.
+type HTTPConfig struct {
+	URL    string            `json:"url"`
+	Method string            `json:"method,omitempty"` // GET, POST, etc. Defaults to POST.
+	Headers map[string]string `json:"headers,omitempty"`
+	Body   string            `json:"body,omitempty"` // Template for request body
+	// TODO: Add authentication, response parsing, etc.
+}
+
+// PromptDefinition defines the structure for dynamically registering a prompt.
+type PromptDefinition struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	InputSchema json.RawMessage `json:"inputSchema,omitempty"` // JSON Schema for input parameters
+	Type        string          `json:"type"`                  // "command", "http"
+	Command     *CommandConfig  `json:"command,omitempty"`
+	HTTP        *HTTPConfig     `json:"http,omitempty"`
 }

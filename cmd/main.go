@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"log"
+	"os"
 
 	"github.com/hawoond/gomcp/server"
 )
@@ -26,7 +27,7 @@ func main() {
 	mcpServer.AddResource("greeting://{name}", "Greeting message by name", func(name string) string {
 		return "Hello, " + name + "!"
 	})
-		type EchoPromptParams struct {
+	type EchoPromptParams struct {
 		Message string `validate:"required" json:"Message"`
 	}
 	mcpServer.AddPrompt("echoPrompt", "Prompt that returns the message as-is", func(message string) string {
@@ -36,6 +37,7 @@ func main() {
 	if *mode == "http" {
 		log.Fatal(mcpServer.ListenAndServe(*addr))
 	} else {
-		log.Fatal(mcpServer.RunStdio())
+		if err := s.RunStdio(os.Stdin, os.Stdout); err != nil {
+		}
 	}
 }
