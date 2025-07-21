@@ -37,7 +37,8 @@ func main() {
 	if *mode == "http" {
 		log.Fatal(mcpServer.ListenAndServe(*addr))
 	} else {
-		if err := s.RunStdio(os.Stdin, os.Stdout); err != nil {
+		if err := mcpServer.RunStdio(os.Stdin, os.Stdout); err != nil {
+			log.Fatal(err)
 		}
 	}
 }
