@@ -22,7 +22,13 @@ func (s *Server) invokeTool(
 	}()
 
 	if tool.Handler != nil {
-		return tool.Handler(ctx, arguments)
+		result, err := tool.Handler(ctx, arguments)
+		if err == nil && tool.OutputSchema != nil {
+			if validationErr := validateSchemaValue(result, tool.OutputSchema); validationErr != nil {
+				return nil, fmt.Errorf("validate tool output: %w", validationErr)
+			}
+		}
+		return result, err
 	}
 	if tool.ParamStructType != nil {
 		paramInstance := reflect.New(tool.ParamStructType).Interface()
@@ -47,6 +53,11 @@ func (s *Server) invokeTool(
 	result, err = s.handleFunctionOutputs(outValues, &responseError)
 	if responseError != nil && err == nil {
 		err = fmt.Errorf("%s", responseError.Message)
+	}
+	if err == nil && tool.OutputSchema != nil {
+		if validationErr := validateSchemaValue(result, tool.OutputSchema); validationErr != nil {
+			return nil, fmt.Errorf("validate tool output: %w", validationErr)
+		}
 	}
 	return result, err
 }

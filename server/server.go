@@ -1,17 +1,14 @@
 package server
 
 import (
-	"bytes"
 	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
-	"os/exec"
 	"reflect"
 	"sort"
 	"strings"
@@ -20,6 +17,8 @@ import (
 
 	"github.com/go-playground/validator/v10"
 	"github.com/google/uuid"
+	"github.com/hawoond/gomcp/auth"
+	"github.com/hawoond/gomcp/executor"
 	"github.com/hawoond/gomcp/internal/types"
 	"github.com/hawoond/gomcp/internal/util"
 	"go.uber.org/zap"
@@ -27,19 +26,30 @@ import (
 
 type Resource struct {
 	URITemplate string
+	Name        string
+	Title       string
 	Description string
+	MimeType    string
+	Icons       []types.Icon
+	Annotations *types.Annotations
+	Meta        map[string]interface{}
 	Func        reflect.Value
 	ParamCount  int
 }
 
 type Tool struct {
 	Name            string
+	Title           string
 	Description     string
 	Func            reflect.Value
 	ParamTypes      []reflect.Type
 	ParamNames      []string
 	ParamStructType reflect.Type
 	InputSchema     map[string]interface{}
+	OutputSchema    map[string]interface{}
+	Annotations     *types.ToolAnnotations
+	Icons           []types.Icon
+	Meta            map[string]interface{}
 	Handler         func(context.Context, map[string]interface{}) (interface{}, error)
 	TaskSupport     string
 }
@@ -51,6 +61,9 @@ type Prompt struct {
 	ParamTypes      []reflect.Type
 	ParamNames      []string
 	ParamStructType reflect.Type
+	Title           string
+	Icons           []types.Icon
+	Meta            map[string]interface{}
 }
 
 type Middleware func(next http.HandlerFunc) http.HandlerFunc
@@ -68,14 +81,17 @@ type Server struct {
 	taskResults               map[string]interface{}
 	taskCancels               map[string]context.CancelFunc
 	taskExpires               map[string]time.Time
+	taskSessions              map[string]string
+	taskNotifiers             map[string]notificationSender
 	tasksMu                   sync.RWMutex
 	validator                 *validator.Validate
 	rwMu                      sync.RWMutex
 	logger                    *zap.Logger
 	EnableAuth                bool
 	APIKey                    string
-	eventSubscribers          map[chan []byte]bool
-	subscribersMu             sync.RWMutex
+	bearerVerifier            auth.TokenVerifier
+	requiredScopes            []string
+	protectedResourceMetadata *auth.ProtectedResourceMetadata
 	middlewares               []Middleware
 	httpClient                *http.Client
 	maxRequestBytes           int64
@@ -87,8 +103,18 @@ type Server struct {
 	allowedCommandPaths       map[string]struct{}
 	allowedHTTPHosts          map[string]struct{}
 	enableExperimentalMethods bool
-	sessions                  map[string]string
+	sessions                  map[string]*httpSession
 	sessionsMu                sync.RWMutex
+	sessionTTL                time.Duration
+	maxSessionEvents          int
+	statelessHTTP             bool
+	stdioTransportsMu         sync.RWMutex
+	stdioTransports           map[string]*stdioTransport
+	pageSize                  int
+	completionHandler         CompletionHandler
+	inflightMu                sync.Mutex
+	inflight                  map[string]context.CancelFunc
+	pendingCancellations      map[string]struct{}
 }
 
 func NewServer(name string, version string, enableAuth bool, apiKey string, supportedVersions ...string) *Server {
@@ -114,11 +140,12 @@ func NewServer(name string, version string, enableAuth bool, apiKey string, supp
 		taskResults:               make(map[string]interface{}),
 		taskCancels:               make(map[string]context.CancelFunc),
 		taskExpires:               make(map[string]time.Time),
+		taskSessions:              make(map[string]string),
+		taskNotifiers:             make(map[string]notificationSender),
 		validator:                 validator.New(),
 		logger:                    logger,
 		EnableAuth:                enableAuth,
 		APIKey:                    apiKey,
-		eventSubscribers:          make(map[chan []byte]bool),
 		middlewares:               []Middleware{},
 		httpClient:                &http.Client{Timeout: 30 * time.Second},
 		maxRequestBytes:           1 << 20,
@@ -129,13 +156,25 @@ func NewServer(name string, version string, enableAuth bool, apiKey string, supp
 		allowedOrigins:            make(map[string]struct{}),
 		allowedCommandPaths:       make(map[string]struct{}),
 		allowedHTTPHosts:          make(map[string]struct{}),
-		sessions:                  make(map[string]string),
+		sessions:                  make(map[string]*httpSession),
+		sessionTTL:                30 * time.Minute,
+		maxSessionEvents:          256,
+		pageSize:                  defaultPageSize,
+		inflight:                  make(map[string]context.CancelFunc),
+		pendingCancellations:      make(map[string]struct{}),
+		stdioTransports:           make(map[string]*stdioTransport),
 	}
 }
 
 func (s *Server) AddResource(uriTemplate string, description string, handler interface{}) error {
 	s.rwMu.Lock()
-	defer s.rwMu.Unlock()
+	registered := false
+	defer func() {
+		s.rwMu.Unlock()
+		if registered {
+			s.PublishNotification("notifications/resources/list_changed", nil)
+		}
+	}()
 	for _, resource := range s.resources {
 		if resource.URITemplate == uriTemplate {
 			return fmt.Errorf("resource %q is already registered", uriTemplate)
@@ -158,13 +197,20 @@ func (s *Server) AddResource(uriTemplate string, description string, handler int
 		ParamCount:  paramCount,
 	}
 	s.resources = append(s.resources, res)
+	registered = true
 	s.logger.Info("Resource registered", zap.String("uriTemplate", uriTemplate))
 	return nil
 }
 
 func (s *Server) AddTool(name string, description string, handler interface{}, paramStruct interface{}, paramNames ...string) error {
 	s.rwMu.Lock()
-	defer s.rwMu.Unlock()
+	registered := false
+	defer func() {
+		s.rwMu.Unlock()
+		if registered {
+			s.PublishNotification("notifications/tools/list_changed", nil)
+		}
+	}()
 	fnVal := reflect.ValueOf(handler)
 	fnType := fnVal.Type()
 	if fnType.Kind() != reflect.Func {
@@ -215,6 +261,17 @@ func (s *Server) AddTool(name string, description string, handler interface{}, p
 	if paramStructType != nil {
 		inputSchema = schemaForType(paramStructType, make(map[reflect.Type]bool))
 	}
+	var outputSchema map[string]interface{}
+	if outCount > 0 && !fnType.Out(0).Implements(reflect.TypeOf((*error)(nil)).Elem()) {
+		outputType := fnType.Out(0)
+		comparableOutputType := outputType
+		for comparableOutputType.Kind() == reflect.Pointer {
+			comparableOutputType = comparableOutputType.Elem()
+		}
+		if comparableOutputType != reflect.TypeOf(types.CallToolResult{}) {
+			outputSchema = schemaForType(outputType, make(map[reflect.Type]bool))
+		}
+	}
 	s.tools[name] = Tool{
 		Name:            name,
 		Description:     description,
@@ -223,15 +280,23 @@ func (s *Server) AddTool(name string, description string, handler interface{}, p
 		ParamNames:      finalParamNames,
 		ParamStructType: paramStructType,
 		InputSchema:     inputSchema,
+		OutputSchema:    outputSchema,
 		TaskSupport:     "optional",
 	}
+	registered = true
 	s.logger.Info("Tool registered", zap.String("name", name))
 	return nil
 }
 
 func (s *Server) AddPrompt(name string, description string, handler interface{}, paramStruct interface{}, paramNames ...string) error {
 	s.rwMu.Lock()
-	defer s.rwMu.Unlock()
+	registered := false
+	defer func() {
+		s.rwMu.Unlock()
+		if registered {
+			s.PublishNotification("notifications/prompts/list_changed", nil)
+		}
+	}()
 	fnVal := reflect.ValueOf(handler)
 	fnType := fnVal.Type()
 	if fnType.Kind() != reflect.Func {
@@ -276,6 +341,7 @@ func (s *Server) AddPrompt(name string, description string, handler interface{},
 		ParamNames:      finalParamNames,
 		ParamStructType: paramStructType,
 	}
+	registered = true
 	s.logger.Info("Prompt registered", zap.String("name", name))
 	return nil
 }
@@ -289,6 +355,39 @@ func (s *Server) RunStdioContext(ctx context.Context, reader io.Reader, writer i
 
 	decoder := json.NewDecoder(reader)
 	encoder := json.NewEncoder(writer)
+	var writerMu sync.Mutex
+	var requests sync.WaitGroup
+	writeMessage := func(message interface{}) error {
+		writerMu.Lock()
+		defer writerMu.Unlock()
+		return encoder.Encode(message)
+	}
+	writeResponse := func(response types.Response) error {
+		return writeMessage(response)
+	}
+	sender := notificationSender(func(method string, params interface{}) error {
+		request := types.Request{JSONRPC: "2.0", Method: method}
+		if params != nil {
+			request.Params, _ = json.Marshal(params)
+		}
+		return writeMessage(request)
+	})
+	peer := newStdioPeer(writeMessage)
+	transportContext := withNotificationSender(ctx, sender)
+	transportContext = withPeerRequester(transportContext, peer.request)
+	transportID := "stdio:" + uuid.NewString()
+	transportContext = withSessionID(transportContext, transportID)
+	s.stdioTransportsMu.Lock()
+	s.stdioTransports[transportID] = &stdioTransport{
+		sender:                sender,
+		resourceSubscriptions: make(map[string]struct{}),
+	}
+	s.stdioTransportsMu.Unlock()
+	defer func() {
+		s.stdioTransportsMu.Lock()
+		delete(s.stdioTransports, transportID)
+		s.stdioTransportsMu.Unlock()
+	}()
 	initialized := false
 	stopClose := make(chan struct{})
 	if closer, ok := reader.(io.Closer); ok {
@@ -301,6 +400,8 @@ func (s *Server) RunStdioContext(ctx context.Context, reader io.Reader, writer i
 		}()
 	}
 	defer close(stopClose)
+	defer requests.Wait()
+	defer peer.close(io.EOF)
 
 	for {
 		if err := ctx.Err(); err != nil {
@@ -315,39 +416,71 @@ func (s *Server) RunStdioContext(ctx context.Context, reader io.Reader, writer i
 				return nil
 			}
 			respErr := s.makeErrorResponse(nil, types.CodeParseError, "Parse error", nil)
-			if encodeErr := encoder.Encode(respErr); encodeErr != nil {
+			if encodeErr := writeResponse(respErr); encodeErr != nil {
 				return encodeErr
+			}
+			continue
+		}
+		var envelope struct {
+			JSONRPC string               `json:"jsonrpc"`
+			ID      *json.RawMessage     `json:"id"`
+			Method  string               `json:"method"`
+			Result  json.RawMessage      `json:"result"`
+			Error   *types.ResponseError `json:"error"`
+		}
+		if err := json.Unmarshal(raw, &envelope); err == nil && envelope.JSONRPC == "2.0" &&
+			envelope.ID != nil && envelope.Method == "" && (len(envelope.Result) > 0 || envelope.Error != nil) {
+			var response types.Response
+			if err := json.Unmarshal(raw, &response); err == nil {
+				peer.deliver(response)
 			}
 			continue
 		}
 		var request types.Request
 		if err := json.Unmarshal(raw, &request); err != nil || request.JSONRPC != "2.0" || request.Method == "" {
-			if err := encoder.Encode(s.makeErrorResponse(nil, types.CodeInvalidRequest, "Invalid Request", nil)); err != nil {
+			if err := writeResponse(s.makeErrorResponse(nil, types.CodeInvalidRequest, "Invalid Request", nil)); err != nil {
 				return err
 			}
 			continue
 		}
 		if !initialized && request.Method != "initialize" {
-			if err := encoder.Encode(s.makeErrorResponse(request.ID, types.CodeInvalidRequest, "initialize must be the first request", nil)); err != nil {
+			if err := writeResponse(s.makeErrorResponse(request.ID, types.CodeInvalidRequest, "initialize must be the first request", nil)); err != nil {
 				return err
 			}
 			continue
 		}
 		if initialized && request.Method == "initialize" {
-			if err := encoder.Encode(s.makeErrorResponse(request.ID, types.CodeInvalidRequest, "server is already initialized", nil)); err != nil {
+			if err := writeResponse(s.makeErrorResponse(request.ID, types.CodeInvalidRequest, "server is already initialized", nil)); err != nil {
 				return err
 			}
 			continue
 		}
-		responses := s.handleMessage(ctx, raw)
-		if request.Method == "initialize" && len(responses) == 1 && responses[0].Error == nil {
-			initialized = true
-		}
-		for _, resp := range responses {
-			if err := encoder.Encode(resp); err != nil {
-				return err
+		if request.Method == "initialize" {
+			responses := s.handleMessage(transportContext, raw)
+			if len(responses) == 1 && responses[0].Error == nil {
+				initialized = true
 			}
+			for _, response := range responses {
+				if err := writeResponse(response); err != nil {
+					return err
+				}
+			}
+			continue
 		}
+		if request.ID == nil {
+			s.handleMessage(transportContext, raw)
+			continue
+		}
+		requests.Add(1)
+		go func(message json.RawMessage) {
+			defer requests.Done()
+			for _, response := range s.handleMessage(transportContext, message) {
+				if err := writeResponse(response); err != nil {
+					s.logger.Error("write stdio response", zap.Error(err))
+					return
+				}
+			}
+		}(append(json.RawMessage(nil), raw...))
 	}
 }
 
@@ -403,11 +536,41 @@ func (s *Server) Handler() http.Handler {
 
 	mux.HandleFunc("/mcp", httpHandler)
 	mux.HandleFunc("/health", s.healthCheckHandler())
+	s.rwMu.RLock()
+	metadata := s.protectedResourceMetadata
+	s.rwMu.RUnlock()
+	if metadata != nil {
+		mux.HandleFunc("/.well-known/oauth-protected-resource", auth.ProtectedResourceMetadataHandler(*metadata))
+	}
 	return mux
 }
 
 func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		s.rwMu.RLock()
+		verifier := s.bearerVerifier
+		requiredScopes := append([]string(nil), s.requiredScopes...)
+		metadata := s.protectedResourceMetadata
+		s.rwMu.RUnlock()
+		if verifier != nil {
+			info, err := auth.VerifyRequest(r.Context(), r, verifier, requiredScopes)
+			if err != nil {
+				challenge := `Bearer error="invalid_token"`
+				status := http.StatusUnauthorized
+				if errors.Is(err, auth.ErrInsufficientScope) {
+					status = http.StatusForbidden
+					challenge = `Bearer error="insufficient_scope"`
+				}
+				if metadata != nil && metadata.Resource != "" {
+					challenge += `, resource_metadata="` + strings.TrimRight(metadata.Resource, "/") + `/.well-known/oauth-protected-resource"`
+				}
+				w.Header().Set("WWW-Authenticate", challenge)
+				http.Error(w, http.StatusText(status), status)
+				return
+			}
+			next.ServeHTTP(w, r.WithContext(auth.NewContext(r.Context(), info)))
+			return
+		}
 		if s.EnableAuth {
 			apiKey := r.Header.Get("X-API-Key")
 			if apiKey == "" || len(apiKey) != len(s.APIKey) ||
@@ -436,7 +599,7 @@ func (s *Server) handleMcpRequest() http.HandlerFunc {
 			return
 		case http.MethodPost:
 		default:
-			w.Header().Set("Allow", "POST, DELETE")
+			w.Header().Set("Allow", "GET, POST, DELETE")
 			http.Error(w, "Invalid method", http.StatusMethodNotAllowed)
 			return
 		}
@@ -479,11 +642,13 @@ func (s *Server) handleMcpRequest() http.HandlerFunc {
 		}
 
 		isInitialize := req.Method == "initialize"
+		sessionID := ""
 		if !isInitialize {
 			if status, message := s.validateSession(r); status != 0 {
 				http.Error(w, message, status)
 				return
 			}
+			sessionID = r.Header.Get("MCP-Session-Id")
 		}
 
 		s.rwMu.RLock()
@@ -501,7 +666,8 @@ func (s *Server) handleMcpRequest() http.HandlerFunc {
 			return
 		}
 
-		responses := s.handleMessage(r.Context(), raw)
+		requestContext := withSessionID(r.Context(), sessionID)
+		responses := s.handleMessage(requestContext, raw)
 		if req.ID == nil {
 			w.WriteHeader(http.StatusAccepted)
 			return
@@ -512,11 +678,12 @@ func (s *Server) handleMcpRequest() http.HandlerFunc {
 		}
 		if isInitialize && responses[0].Error == nil {
 			protocolVersion := initializationProtocolVersion(responses[0].Result)
-			sessionID := uuid.NewString()
-			s.sessionsMu.Lock()
-			s.sessions[sessionID] = protocolVersion
-			s.sessionsMu.Unlock()
-			w.Header().Set("MCP-Session-Id", sessionID)
+			s.rwMu.RLock()
+			stateless := s.statelessHTTP
+			s.rwMu.RUnlock()
+			if !stateless {
+				w.Header().Set("MCP-Session-Id", s.createSession(protocolVersion))
+			}
 		}
 
 		w.Header().Set("Content-Type", "application/json")
@@ -527,6 +694,13 @@ func (s *Server) handleMcpRequest() http.HandlerFunc {
 }
 
 func (s *Server) serveNotificationStream(w http.ResponseWriter, r *http.Request) {
+	s.rwMu.RLock()
+	stateless := s.statelessHTTP
+	s.rwMu.RUnlock()
+	if stateless {
+		http.Error(w, "Notification streams are disabled in stateless mode", http.StatusMethodNotAllowed)
+		return
+	}
 	if !strings.Contains(strings.ToLower(r.Header.Get("Accept")), "text/event-stream") {
 		http.Error(w, "Accept must include text/event-stream", http.StatusNotAcceptable)
 		return
@@ -540,15 +714,30 @@ func (s *Server) serveNotificationStream(w http.ResponseWriter, r *http.Request)
 		http.Error(w, "Streaming unsupported", http.StatusInternalServerError)
 		return
 	}
+	lastEventID, err := parseLastEventID(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	session, ok := s.session(r.Header.Get("MCP-Session-Id"))
+	if !ok {
+		http.Error(w, "MCP session not found", http.StatusNotFound)
+		return
+	}
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	_, _ = fmt.Fprint(w, "event: ready\ndata:\n\n")
 	flusher.Flush()
 
-	notifications := make(chan []byte, 64)
-	s.addSubscriber(notifications)
-	defer s.removeSubscriber(notifications)
+	notifications, replay := s.addSessionSubscriber(session, lastEventID)
+	defer s.removeSessionSubscriber(session, notifications)
+	for _, notification := range replay {
+		if _, err := fmt.Fprintf(w, "id: %d\ndata: %s\n\n", notification.ID, notification.Data); err != nil {
+			return
+		}
+	}
+	flusher.Flush()
 	heartbeat := time.NewTicker(20 * time.Second)
 	defer heartbeat.Stop()
 
@@ -558,7 +747,7 @@ func (s *Server) serveNotificationStream(w http.ResponseWriter, r *http.Request)
 			if !open {
 				return
 			}
-			if _, err := fmt.Fprintf(w, "data: %s\n\n", notification); err != nil {
+			if _, err := fmt.Fprintf(w, "id: %d\ndata: %s\n\n", notification.ID, notification.Data); err != nil {
 				return
 			}
 			flusher.Flush()
@@ -597,16 +786,23 @@ func (s *Server) originAllowed(r *http.Request) bool {
 }
 
 func (s *Server) validateSession(r *http.Request) (int, string) {
+	s.rwMu.RLock()
+	stateless := s.statelessHTTP
+	s.rwMu.RUnlock()
+	if stateless {
+		return 0, ""
+	}
 	sessionID := r.Header.Get("MCP-Session-Id")
 	if sessionID == "" {
 		return http.StatusBadRequest, "MCP-Session-Id is required"
 	}
-	s.sessionsMu.RLock()
-	protocolVersion, ok := s.sessions[sessionID]
-	s.sessionsMu.RUnlock()
+	session, ok := s.session(sessionID)
 	if !ok {
 		return http.StatusNotFound, "MCP session not found"
 	}
+	session.mu.Lock()
+	protocolVersion := session.protocolVersion
+	session.mu.Unlock()
 	if r.Header.Get("MCP-Protocol-Version") != protocolVersion {
 		return http.StatusBadRequest, "MCP-Protocol-Version does not match the session"
 	}
@@ -619,9 +815,7 @@ func (s *Server) deleteSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sessionID := r.Header.Get("MCP-Session-Id")
-	s.sessionsMu.Lock()
-	delete(s.sessions, sessionID)
-	s.sessionsMu.Unlock()
+	s.closeSession(sessionID)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -691,10 +885,25 @@ func (s *Server) processRequest(ctx context.Context, req *types.Request) []types
 		_, _ = s.routeMethod(ctx, req, nil)
 		return []types.Response{}
 	}
+	requestContext, cancel := context.WithCancel(ctx)
+	key := requestKey(ctx, *req.ID)
+	s.inflightMu.Lock()
+	s.inflight[key] = cancel
+	if _, cancelled := s.pendingCancellations[key]; cancelled {
+		delete(s.pendingCancellations, key)
+		cancel()
+	}
+	s.inflightMu.Unlock()
+	defer func() {
+		cancel()
+		s.inflightMu.Lock()
+		delete(s.inflight, key)
+		s.inflightMu.Unlock()
+	}()
 	var resp types.Response
 	resp.ID = req.ID
 	resp.JSONRPC = "2.0"
-	result, err := s.routeMethod(ctx, req, &resp.Error)
+	result, err := s.routeMethod(requestContext, req, &resp.Error)
 	if err != nil {
 		resp.Result = nil
 	} else {
@@ -708,6 +917,35 @@ func (s *Server) routeMethod(ctx context.Context, req *types.Request, respErrPtr
 	method := req.Method
 	s.logger.Info("Routing method", zap.String("method", method))
 	switch method {
+	case "notifications/cancelled":
+		var params types.CancelledParams
+		if err := json.Unmarshal(req.Params, &params); err != nil || len(params.RequestID) == 0 {
+			return nil, errors.New("invalid cancellation parameters")
+		}
+		key := requestKey(ctx, params.RequestID)
+		s.inflightMu.Lock()
+		cancel := s.inflight[key]
+		if cancel == nil {
+			if len(s.pendingCancellations) >= 1024 {
+				for pendingKey := range s.pendingCancellations {
+					delete(s.pendingCancellations, pendingKey)
+					break
+				}
+			}
+			s.pendingCancellations[key] = struct{}{}
+		}
+		s.inflightMu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+		return nil, nil
+
+	case "notifications/progress":
+		var params types.ProgressParams
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			return nil, errors.New("invalid progress parameters")
+		}
+		return nil, nil
 
 	case "initialize":
 		var params struct {
@@ -737,9 +975,11 @@ func (s *Server) routeMethod(ctx context.Context, req *types.Request, respErrPtr
 
 		s.logger.Info("Processing initialize request", zap.Any("client", params.ClientInfo), zap.String("protocolVersion", params.ProtocolVersion))
 		serverCaps := map[string]interface{}{
-			"tools":     map[string]interface{}{"listChanged": false},
-			"resources": map[string]interface{}{"subscribe": false, "listChanged": false},
-			"prompts":   map[string]interface{}{"listChanged": false},
+			"tools":       map[string]interface{}{"listChanged": true},
+			"resources":   map[string]interface{}{"subscribe": true, "listChanged": true},
+			"prompts":     map[string]interface{}{"listChanged": true},
+			"completions": map[string]interface{}{},
+			"logging":     map[string]interface{}{},
 			"tasks": map[string]interface{}{
 				"list":   map[string]interface{}{},
 				"cancel": map[string]interface{}{},
@@ -758,24 +998,38 @@ func (s *Server) routeMethod(ctx context.Context, req *types.Request, respErrPtr
 		}
 		return result, nil
 
+	case "ping":
+		return map[string]interface{}{}, nil
+
 	case "tools/list":
+		var params types.PaginatedParams
+		if len(req.Params) > 0 {
+			if err := json.Unmarshal(req.Params, &params); err != nil {
+				*respErrPtr = s.newError(types.CodeInvalidParams, "Invalid params", nil)
+				return nil, err
+			}
+		}
 		s.rwMu.RLock()
-		defer s.rwMu.RUnlock()
 		toolNames := make([]string, 0, len(s.tools))
 		for name := range s.tools {
 			toolNames = append(toolNames, name)
 		}
 		sort.Strings(toolNames)
-		toolsList := make([]map[string]interface{}, 0, len(s.tools)+len(s.dynamicTools))
+		toolsList := make([]types.ToolInfo, 0, len(s.tools)+len(s.dynamicTools))
 		for _, name := range toolNames {
 			tool := s.tools[name]
-			entry := map[string]interface{}{
-				"name":        name,
-				"description": tool.Description,
-				"inputSchema": tool.InputSchema,
+			entry := types.ToolInfo{
+				Name:         name,
+				Title:        tool.Title,
+				Description:  tool.Description,
+				InputSchema:  tool.InputSchema,
+				OutputSchema: tool.OutputSchema,
+				Annotations:  tool.Annotations,
+				Icons:        append([]types.Icon(nil), tool.Icons...),
+				Meta:         tool.Meta,
 			}
 			if tool.TaskSupport != "" {
-				entry["execution"] = map[string]interface{}{"taskSupport": tool.TaskSupport}
+				entry.Execution = map[string]interface{}{"taskSupport": tool.TaskSupport}
 			}
 			toolsList = append(toolsList, entry)
 		}
@@ -787,22 +1041,27 @@ func (s *Server) routeMethod(ctx context.Context, req *types.Request, respErrPtr
 		sort.Strings(dynamicNames)
 		for _, name := range dynamicNames {
 			toolDef := s.dynamicTools[name]
-			toolEntry := map[string]interface{}{
-				"name":        name,
-				"description": toolDef.Description,
+			toolEntry := types.ToolInfo{
+				Name:        name,
+				Description: toolDef.Description,
+				InputSchema: map[string]interface{}{"type": "object"},
 			}
 			if toolDef.InputSchema != nil {
 				var schema map[string]interface{}
-				json.Unmarshal(toolDef.InputSchema, &schema)
-				toolEntry["inputSchema"] = schema
+				if err := json.Unmarshal(toolDef.InputSchema, &schema); err == nil {
+					toolEntry.InputSchema = schema
+				}
 			}
 			toolsList = append(toolsList, toolEntry)
 		}
-
-		result := map[string]interface{}{
-			"tools": toolsList,
+		pageSize := s.pageSize
+		s.rwMu.RUnlock()
+		page, nextCursor, err := paginate(toolsList, params.Cursor, pageSize)
+		if err != nil {
+			*respErrPtr = s.newError(types.CodeInvalidParams, err.Error(), nil)
+			return nil, err
 		}
-		return result, nil
+		return types.ListToolsResult{Tools: page, NextCursor: nextCursor}, nil
 
 	case "tools/call":
 		var params struct {
@@ -838,7 +1097,7 @@ func (s *Server) routeMethod(ctx context.Context, req *types.Request, respErrPtr
 				*respErrPtr = s.newError(types.CodeInvalidParams, "Tool does not support task execution", nil)
 				return nil, errors.New("task unsupported")
 			}
-			task, err := s.startToolTask(tool, params.Arguments, params.Task.TTL)
+			task, err := s.startToolTask(ctx, tool, params.Arguments, params.Task.TTL)
 			if err != nil {
 				*respErrPtr = s.newError(types.CodeServerError, err.Error(), nil)
 				return nil, err
@@ -872,7 +1131,7 @@ func (s *Server) routeMethod(ctx context.Context, req *types.Request, respErrPtr
 			*respErrPtr = s.newError(types.CodeMethodNotFound, "Tool not found", nil)
 			return nil, errors.New("tool not found")
 		}
-		task, err := s.startToolTask(tool, params.Arguments, 0)
+		task, err := s.startToolTask(ctx, tool, params.Arguments, 0)
 		if err != nil {
 			*respErrPtr = s.newError(types.CodeServerError, err.Error(), nil)
 			return nil, err
@@ -894,7 +1153,7 @@ func (s *Server) routeMethod(ctx context.Context, req *types.Request, respErrPtr
 			*respErrPtr = s.newError(types.CodeInvalidParams, "Invalid params", nil)
 			return nil, errors.New("param parse error")
 		}
-		task, err := s.getTask(params.TaskID)
+		task, err := s.getTask(ctx, params.TaskID)
 		if err != nil {
 			*respErrPtr = s.newError(types.CodeTaskNotFound, "Task not found", nil)
 			return nil, err
@@ -909,7 +1168,7 @@ func (s *Server) routeMethod(ctx context.Context, req *types.Request, respErrPtr
 			*respErrPtr = s.newError(types.CodeInvalidParams, "taskId is required", nil)
 			return nil, errors.New("invalid task parameters")
 		}
-		task, err := s.getTask(params.TaskID)
+		task, err := s.getTask(ctx, params.TaskID)
 		if err != nil {
 			*respErrPtr = s.newError(types.CodeTaskNotFound, "Task not found", nil)
 			return nil, err
@@ -924,7 +1183,7 @@ func (s *Server) routeMethod(ctx context.Context, req *types.Request, respErrPtr
 			*respErrPtr = s.newError(types.CodeInvalidParams, "taskId is required", nil)
 			return nil, errors.New("invalid task parameters")
 		}
-		result, err := s.getTaskResult(params.TaskID)
+		result, err := s.getTaskResult(ctx, params.TaskID)
 		if err != nil {
 			*respErrPtr = s.newError(types.CodeServerError, err.Error(), nil)
 			return nil, err
@@ -941,7 +1200,11 @@ func (s *Server) routeMethod(ctx context.Context, req *types.Request, respErrPtr
 				return nil, err
 			}
 		}
-		tasks, nextCursor := s.listTasks(params.Cursor)
+		tasks, nextCursor, err := s.listTasks(ctx, params.Cursor)
+		if err != nil {
+			*respErrPtr = s.newError(types.CodeInvalidParams, err.Error(), nil)
+			return nil, err
+		}
 		result := map[string]interface{}{"tasks": tasks}
 		if nextCursor != "" {
 			result["nextCursor"] = nextCursor
@@ -956,7 +1219,7 @@ func (s *Server) routeMethod(ctx context.Context, req *types.Request, respErrPtr
 			*respErrPtr = s.newError(types.CodeInvalidParams, "taskId is required", nil)
 			return nil, errors.New("invalid task parameters")
 		}
-		task, err := s.cancelTask(params.TaskID)
+		task, err := s.cancelTask(ctx, params.TaskID)
 		if err != nil {
 			*respErrPtr = s.newError(types.CodeTaskNotFound, "Task not found", nil)
 			return nil, err
@@ -1014,24 +1277,88 @@ func (s *Server) routeMethod(ctx context.Context, req *types.Request, respErrPtr
 		return s.handleFunctionOutputs(outVals, respErrPtr)
 
 	case "resources/list":
+		var params types.PaginatedParams
+		if len(req.Params) > 0 {
+			if err := json.Unmarshal(req.Params, &params); err != nil {
+				*respErrPtr = s.newError(types.CodeInvalidParams, "Invalid params", nil)
+				return nil, err
+			}
+		}
 		s.rwMu.RLock()
-		defer s.rwMu.RUnlock()
 		resources := append([]Resource(nil), s.resources...)
+		pageSize := s.pageSize
+		s.rwMu.RUnlock()
 		sort.Slice(resources, func(i, j int) bool {
 			return resources[i].URITemplate < resources[j].URITemplate
 		})
-		resourcesList := make([]map[string]interface{}, 0, len(resources))
+		resourcesList := make([]types.ResourceInfo, 0, len(resources))
 		for _, res := range resources {
-			resourcesList = append(resourcesList, map[string]interface{}{
-				"name":        res.URITemplate,
-				"uri":         res.URITemplate,
-				"description": res.Description,
+			if strings.Contains(res.URITemplate, "{") {
+				continue
+			}
+			name := res.Name
+			if name == "" {
+				name = res.URITemplate
+			}
+			resourcesList = append(resourcesList, types.ResourceInfo{
+				Name:        name,
+				URI:         res.URITemplate,
+				Title:       res.Title,
+				Description: res.Description,
+				MimeType:    res.MimeType,
+				Icons:       append([]types.Icon(nil), res.Icons...),
+				Annotations: res.Annotations,
+				Meta:        res.Meta,
 			})
 		}
-		result := map[string]interface{}{
-			"resources": resourcesList,
+		page, nextCursor, err := paginate(resourcesList, params.Cursor, pageSize)
+		if err != nil {
+			*respErrPtr = s.newError(types.CodeInvalidParams, err.Error(), nil)
+			return nil, err
 		}
-		return result, nil
+		return types.ListResourcesResult{Resources: page, NextCursor: nextCursor}, nil
+
+	case "resources/templates/list":
+		var params types.PaginatedParams
+		if len(req.Params) > 0 {
+			if err := json.Unmarshal(req.Params, &params); err != nil {
+				*respErrPtr = s.newError(types.CodeInvalidParams, "Invalid params", nil)
+				return nil, err
+			}
+		}
+		s.rwMu.RLock()
+		resources := append([]Resource(nil), s.resources...)
+		pageSize := s.pageSize
+		s.rwMu.RUnlock()
+		sort.Slice(resources, func(i, j int) bool {
+			return resources[i].URITemplate < resources[j].URITemplate
+		})
+		templates := make([]types.ResourceTemplate, 0, len(resources))
+		for _, res := range resources {
+			if !strings.Contains(res.URITemplate, "{") {
+				continue
+			}
+			name := res.Name
+			if name == "" {
+				name = res.URITemplate
+			}
+			templates = append(templates, types.ResourceTemplate{
+				URITemplate: res.URITemplate,
+				Name:        name,
+				Title:       res.Title,
+				Description: res.Description,
+				MimeType:    res.MimeType,
+				Icons:       append([]types.Icon(nil), res.Icons...),
+				Annotations: res.Annotations,
+				Meta:        res.Meta,
+			})
+		}
+		page, nextCursor, err := paginate(templates, params.Cursor, pageSize)
+		if err != nil {
+			*respErrPtr = s.newError(types.CodeInvalidParams, err.Error(), nil)
+			return nil, err
+		}
+		return types.ListResourceTemplatesResult{ResourceTemplates: page, NextCursor: nextCursor}, nil
 
 	case "resources/read":
 		s.rwMu.RLock()
@@ -1064,30 +1391,51 @@ func (s *Server) routeMethod(ctx context.Context, req *types.Request, respErrPtr
 		*respErrPtr = s.newError(types.CodeInvalidParams, "Resource not found", nil)
 		return nil, errors.New("resource not found")
 
+	case "resources/subscribe", "resources/unsubscribe":
+		var params struct {
+			URI string `json:"uri"`
+		}
+		if err := json.Unmarshal(req.Params, &params); err != nil || params.URI == "" {
+			*respErrPtr = s.newError(types.CodeInvalidParams, "uri is required", nil)
+			return nil, errors.New("invalid subscription parameters")
+		}
+		if err := s.setResourceSubscription(ctx, params.URI, method == "resources/subscribe"); err != nil {
+			*respErrPtr = s.newError(types.CodeInvalidRequest, err.Error(), nil)
+			return nil, err
+		}
+		return map[string]interface{}{}, nil
+
 	case "prompts/list":
+		var params types.PaginatedParams
+		if len(req.Params) > 0 {
+			if err := json.Unmarshal(req.Params, &params); err != nil {
+				*respErrPtr = s.newError(types.CodeInvalidParams, "Invalid params", nil)
+				return nil, err
+			}
+		}
 		s.rwMu.RLock()
-		defer s.rwMu.RUnlock()
 		promptNames := make([]string, 0, len(s.prompts))
 		for name := range s.prompts {
 			promptNames = append(promptNames, name)
 		}
 		sort.Strings(promptNames)
-		promptsList := make([]map[string]interface{}, 0, len(s.prompts)+len(s.dynamicPrompts))
+		promptsList := make([]types.PromptInfo, 0, len(s.prompts)+len(s.dynamicPrompts))
 		for _, name := range promptNames {
 			prompt := s.prompts[name]
-			arguments := make([]map[string]interface{}, 0, len(prompt.ParamNames))
+			arguments := make([]types.PromptArgument, 0, len(prompt.ParamNames))
 			for _, paramName := range prompt.ParamNames {
-				arguments = append(arguments, map[string]interface{}{
-					"name":     paramName,
-					"required": true,
+				arguments = append(arguments, types.PromptArgument{
+					Name:     paramName,
+					Required: true,
 				})
 			}
-			entry := map[string]interface{}{
-				"name":        prompt.Name,
-				"description": prompt.Description,
-			}
-			if len(arguments) > 0 {
-				entry["arguments"] = arguments
+			entry := types.PromptInfo{
+				Name:        prompt.Name,
+				Title:       prompt.Title,
+				Description: prompt.Description,
+				Arguments:   arguments,
+				Icons:       append([]types.Icon(nil), prompt.Icons...),
+				Meta:        prompt.Meta,
 			}
 			promptsList = append(promptsList, entry)
 		}
@@ -1098,16 +1446,20 @@ func (s *Server) routeMethod(ctx context.Context, req *types.Request, respErrPtr
 		sort.Strings(dynamicNames)
 		for _, name := range dynamicNames {
 			promptDef := s.dynamicPrompts[name]
-			promptEntry := map[string]interface{}{
-				"name":        name,
-				"description": promptDef.Description,
+			promptEntry := types.PromptInfo{
+				Name:        name,
+				Description: promptDef.Description,
 			}
 			promptsList = append(promptsList, promptEntry)
 		}
-		result := map[string]interface{}{
-			"prompts": promptsList,
+		pageSize := s.pageSize
+		s.rwMu.RUnlock()
+		page, nextCursor, err := paginate(promptsList, params.Cursor, pageSize)
+		if err != nil {
+			*respErrPtr = s.newError(types.CodeInvalidParams, err.Error(), nil)
+			return nil, err
 		}
-		return result, nil
+		return types.ListPromptsResult{Prompts: page, NextCursor: nextCursor}, nil
 
 	case "prompts/get":
 		s.rwMu.RLock()
@@ -1138,13 +1490,24 @@ func (s *Server) routeMethod(ctx context.Context, req *types.Request, respErrPtr
 		}
 		return promptResult(prompt.Description, value), nil
 
-	case "tools/register":
+	case "completion/complete":
+		var params types.CompleteParams
+		if err := json.Unmarshal(req.Params, &params); err != nil || params.Argument.Name == "" {
+			*respErrPtr = s.newError(types.CodeInvalidParams, "Invalid completion parameters", nil)
+			return nil, errors.New("invalid completion parameters")
+		}
+		result, err := s.complete(ctx, params)
+		if err != nil {
+			*respErrPtr = s.newError(types.CodeServerError, err.Error(), nil)
+			return nil, err
+		}
+		return result, nil
+
+	case "x-gomcp/tools/register", "tools/register":
 		if !s.experimentalMethodsEnabled() {
 			*respErrPtr = s.newError(types.CodeMethodNotFound, "Method not found", nil)
 			return nil, errors.New("experimental methods disabled")
 		}
-		s.rwMu.Lock()
-		defer s.rwMu.Unlock()
 		var toolDef types.ToolDefinition
 		if err := json.Unmarshal(req.Params, &toolDef); err != nil {
 			*respErrPtr = s.newError(types.CodeInvalidParams, "Invalid params: "+err.Error(), nil)
@@ -1159,17 +1522,18 @@ func (s *Server) routeMethod(ctx context.Context, req *types.Request, respErrPtr
 			return nil, err
 		}
 
+		s.rwMu.Lock()
 		s.dynamicTools[toolDef.Name] = toolDef
+		s.rwMu.Unlock()
+		s.PublishNotification("notifications/tools/list_changed", nil)
 		s.logger.Info("Dynamic tool registered", zap.String("name", toolDef.Name), zap.String("type", toolDef.Type))
 		return map[string]interface{}{"status": "ok", "name": toolDef.Name}, nil
 
-	case "tools/unregister":
+	case "x-gomcp/tools/unregister", "tools/unregister":
 		if !s.experimentalMethodsEnabled() {
 			*respErrPtr = s.newError(types.CodeMethodNotFound, "Method not found", nil)
 			return nil, errors.New("experimental methods disabled")
 		}
-		s.rwMu.Lock()
-		defer s.rwMu.Unlock()
 		var params struct {
 			Name string `json:"name"`
 		}
@@ -1177,21 +1541,23 @@ func (s *Server) routeMethod(ctx context.Context, req *types.Request, respErrPtr
 			*respErrPtr = s.newError(types.CodeInvalidParams, "Invalid params", nil)
 			return nil, errors.New("param parse error")
 		}
+		s.rwMu.Lock()
 		if _, ok := s.dynamicTools[params.Name]; !ok {
+			s.rwMu.Unlock()
 			*respErrPtr = s.newError(types.CodeMethodNotFound, "Tool not found", nil)
 			return nil, errors.New("tool not found")
 		}
 		delete(s.dynamicTools, params.Name)
+		s.rwMu.Unlock()
+		s.PublishNotification("notifications/tools/list_changed", nil)
 		s.logger.Info("Tool unregistered", zap.String("name", params.Name))
 		return map[string]interface{}{"status": "ok"}, nil
 
-	case "prompts/register":
+	case "x-gomcp/prompts/register", "prompts/register":
 		if !s.experimentalMethodsEnabled() {
 			*respErrPtr = s.newError(types.CodeMethodNotFound, "Method not found", nil)
 			return nil, errors.New("experimental methods disabled")
 		}
-		s.rwMu.Lock()
-		defer s.rwMu.Unlock()
 		var promptDef types.PromptDefinition
 		if err := json.Unmarshal(req.Params, &promptDef); err != nil {
 			*respErrPtr = s.newError(types.CodeInvalidParams, "Invalid params: "+err.Error(), nil)
@@ -1206,17 +1572,18 @@ func (s *Server) routeMethod(ctx context.Context, req *types.Request, respErrPtr
 			return nil, err
 		}
 
+		s.rwMu.Lock()
 		s.dynamicPrompts[promptDef.Name] = promptDef
+		s.rwMu.Unlock()
+		s.PublishNotification("notifications/prompts/list_changed", nil)
 		s.logger.Info("Dynamic prompt registered", zap.String("name", promptDef.Name), zap.String("type", promptDef.Type))
 		return map[string]interface{}{"status": "ok", "name": promptDef.Name}, nil
 
-	case "prompts/unregister":
+	case "x-gomcp/prompts/unregister", "prompts/unregister":
 		if !s.experimentalMethodsEnabled() {
 			*respErrPtr = s.newError(types.CodeMethodNotFound, "Method not found", nil)
 			return nil, errors.New("experimental methods disabled")
 		}
-		s.rwMu.Lock()
-		defer s.rwMu.Unlock()
 		var params struct {
 			Name string `json:"name"`
 		}
@@ -1224,19 +1591,23 @@ func (s *Server) routeMethod(ctx context.Context, req *types.Request, respErrPtr
 			*respErrPtr = s.newError(types.CodeInvalidParams, "Invalid params", nil)
 			return nil, errors.New("param parse error")
 		}
+		s.rwMu.Lock()
 		if _, ok := s.dynamicPrompts[params.Name]; !ok {
+			s.rwMu.Unlock()
 			*respErrPtr = s.newError(types.CodeMethodNotFound, "Prompt not found", nil)
 			return nil, errors.New("prompt not found")
 		}
 		delete(s.dynamicPrompts, params.Name)
+		s.rwMu.Unlock()
+		s.PublishNotification("notifications/prompts/list_changed", nil)
 		s.logger.Info("Prompt unregistered", zap.String("name", params.Name))
 		return map[string]interface{}{"status": "ok"}, nil
 
-	case "resources/register":
+	case "x-gomcp/resources/register", "resources/register":
 		*respErrPtr = s.newError(types.CodeMethodNotFound, "Method not found", nil)
 		return nil, errors.New("remote resource registration is not supported")
 
-	case "resources/unregister":
+	case "x-gomcp/resources/unregister", "resources/unregister":
 		*respErrPtr = s.newError(types.CodeMethodNotFound, "Method not found", nil)
 		return nil, errors.New("remote resource unregistration is not supported")
 
@@ -1271,179 +1642,58 @@ func (s *Server) callDynamicTool(ctx context.Context, toolDef types.ToolDefiniti
 }
 
 func (s *Server) executeCommand(ctx context.Context, cmdConfig *types.CommandConfig, args map[string]interface{}, respErrPtr **types.ResponseError) (interface{}, error) {
-	resolvedPath, err := exec.LookPath(cmdConfig.Path)
-	if err != nil {
-		*respErrPtr = s.newError(types.CodeInvalidParams, "Command is not available", nil)
-		return nil, err
-	}
 	s.rwMu.RLock()
-	_, allowed := s.allowedCommandPaths[resolvedPath]
-	timeout := s.commandTimeout
-	maxOutputBytes := s.maxResponseBytes
+	policy := executor.Policy{
+		AllowedCommands:  copyStringSet(s.allowedCommandPaths),
+		HTTPClient:       s.httpClient,
+		CommandTimeout:   s.commandTimeout,
+		MaxResponseBytes: s.maxResponseBytes,
+	}
 	s.rwMu.RUnlock()
-	if !allowed {
-		err := fmt.Errorf("command %q is not allowlisted", resolvedPath)
-		*respErrPtr = s.newError(types.CodeInvalidParams, err.Error(), nil)
-		return nil, err
-	}
-	if cmdConfig.TimeoutMillis > 0 {
-		configuredTimeout := time.Duration(cmdConfig.TimeoutMillis) * time.Millisecond
-		if configuredTimeout < timeout {
-			timeout = configuredTimeout
-		}
-	}
-	commandCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	cmdArgs := make([]string, 0, len(cmdConfig.Args)+len(args))
-	cmdArgs = append(cmdArgs, cmdConfig.Args...)
-	argNames := make([]string, 0, len(args))
-	for name := range args {
-		argNames = append(argNames, name)
-	}
-	sort.Strings(argNames)
-	for _, name := range argNames {
-		cmdArgs = append(cmdArgs, fmt.Sprintf("%v", args[name]))
-	}
-
-	output := newLimitedBuffer(maxOutputBytes)
-	cmd := exec.CommandContext(commandCtx, resolvedPath, cmdArgs...)
-	cmd.Stdout = output
-	cmd.Stderr = output
-	err = cmd.Run()
-	if output.Exceeded() {
-		err = errOutputLimitExceeded
-	}
+	output, err := executor.RunCommand(ctx, cmdConfig, args, policy)
 	if err != nil {
-		*respErrPtr = s.newError(types.CodeServerError, "Command execution failed: "+err.Error(), output.String())
+		s.setExecutorError(respErrPtr, err)
 		return nil, err
 	}
-	return output.String(), nil
+	return output, nil
 }
 
 func (s *Server) executeHTTPRequest(ctx context.Context, httpConfig *types.HTTPConfig, args map[string]interface{}, respErrPtr **types.ResponseError) (interface{}, error) {
-	targetURL, err := url.Parse(httpConfig.URL)
-	if err != nil || (targetURL.Scheme != "http" && targetURL.Scheme != "https") || targetURL.Hostname() == "" {
-		err = errors.New("invalid HTTP target URL")
-		*respErrPtr = s.newError(types.CodeInvalidParams, err.Error(), nil)
-		return nil, err
-	}
-	host := strings.ToLower(targetURL.Hostname())
 	s.rwMu.RLock()
-	_, allowed := s.allowedHTTPHosts[host]
-	if !allowed {
-		_, allowed = s.allowedHTTPHosts[strings.ToLower(targetURL.Host)]
+	policy := executor.Policy{
+		AllowedHTTPHosts: copyStringSet(s.allowedHTTPHosts),
+		HTTPClient:       s.httpClient,
+		CommandTimeout:   s.commandTimeout,
+		MaxResponseBytes: s.maxResponseBytes,
 	}
-	baseClient := s.httpClient
-	maxResponseBytes := s.maxResponseBytes
 	s.rwMu.RUnlock()
-	if !allowed {
-		err = fmt.Errorf("HTTP host %q is not allowlisted", host)
-		*respErrPtr = s.newError(types.CodeInvalidParams, err.Error(), nil)
-		return nil, err
-	}
-	if err := validatePublicHost(ctx, host); err != nil {
-		*respErrPtr = s.newError(types.CodeInvalidParams, err.Error(), nil)
-		return nil, err
-	}
-
-	method := strings.ToUpper(httpConfig.Method)
-	if method == "" {
-		method = http.MethodPost
-	}
-	switch method {
-	case http.MethodGet, http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
-	default:
-		err = fmt.Errorf("HTTP method %q is not allowed", method)
-		*respErrPtr = s.newError(types.CodeInvalidParams, err.Error(), nil)
-		return nil, err
-	}
-
-	var reqBody io.Reader
-	if httpConfig.Body != "" {
-		bodyContent := httpConfig.Body
-		for k, v := range args {
-			bodyContent = strings.ReplaceAll(bodyContent, "{"+k+"}", fmt.Sprintf("%v", v))
-		}
-		reqBody = strings.NewReader(bodyContent)
-	} else if method == http.MethodPost || method == http.MethodPut || method == http.MethodPatch {
-		jsonArgs, marshalErr := json.Marshal(args)
-		if marshalErr != nil {
-			*respErrPtr = s.newError(types.CodeInternalError, "Failed to marshal arguments to JSON: "+marshalErr.Error(), nil)
-			return nil, marshalErr
-		}
-		reqBody = bytes.NewReader(jsonArgs)
-	}
-
-	requestCtx := ctx
-	cancel := func() {}
-	if httpConfig.TimeoutMillis > 0 {
-		requestCtx, cancel = context.WithTimeout(ctx, time.Duration(httpConfig.TimeoutMillis)*time.Millisecond)
-	}
-	defer cancel()
-	req, err := http.NewRequestWithContext(requestCtx, method, targetURL.String(), reqBody)
+	output, err := executor.RunHTTP(ctx, httpConfig, args, policy)
 	if err != nil {
-		*respErrPtr = s.newError(types.CodeInternalError, "Failed to create HTTP request: "+err.Error(), nil)
+		s.setExecutorError(respErrPtr, err)
 		return nil, err
 	}
-	for k, v := range httpConfig.Headers {
-		if strings.EqualFold(k, "Host") {
-			continue
-		}
-		req.Header.Set(k, v)
-	}
-	if (method == http.MethodPost || method == http.MethodPut || method == http.MethodPatch) && req.Header.Get("Content-Type") == "" {
-		req.Header.Set("Content-Type", "application/json")
-	}
-
-	client := *baseClient
-	client.CheckRedirect = func(next *http.Request, via []*http.Request) error {
-		return http.ErrUseLastResponse
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		*respErrPtr = s.newError(types.CodeServerError, "HTTP request failed: "+err.Error(), nil)
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if httpConfig.MaxResponseBytes > 0 && httpConfig.MaxResponseBytes < maxResponseBytes {
-		maxResponseBytes = httpConfig.MaxResponseBytes
-	}
-	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
-	if err != nil {
-		*respErrPtr = s.newError(types.CodeServerError, "Failed to read HTTP response body: "+err.Error(), nil)
-		return nil, err
-	}
-	if int64(len(respBody)) > maxResponseBytes {
-		err = fmt.Errorf("HTTP response exceeds %d bytes", maxResponseBytes)
-		*respErrPtr = s.newError(types.CodeServerError, err.Error(), nil)
-		return nil, err
-	}
-	if resp.StatusCode >= 400 {
-		err = fmt.Errorf("HTTP request failed with status %d", resp.StatusCode)
-		*respErrPtr = s.newError(types.CodeServerError, err.Error(), string(respBody))
-		return nil, err
-	}
-	return string(respBody), nil
+	return output, nil
 }
 
-func validatePublicHost(ctx context.Context, host string) error {
-	addresses, err := net.DefaultResolver.LookupIPAddr(ctx, host)
-	if err != nil {
-		return fmt.Errorf("resolve HTTP host %q: %w", host, err)
-	}
-	if len(addresses) == 0 {
-		return fmt.Errorf("HTTP host %q has no addresses", host)
-	}
-	for _, address := range addresses {
-		ip := address.IP
-		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
-			ip.IsLinkLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast() {
-			return fmt.Errorf("HTTP host %q resolves to a non-public address", host)
+func (s *Server) setExecutorError(responseError **types.ResponseError, err error) {
+	code := types.CodeServerError
+	var executionError *executor.Error
+	if errors.As(err, &executionError) {
+		if executionError.Kind == executor.ErrorConfiguration || executionError.Kind == executor.ErrorPolicy {
+			code = types.CodeInvalidParams
 		}
+		*responseError = s.newError(code, executionError.Error(), executionError.Details)
+		return
 	}
-	return nil
+	*responseError = s.newError(code, err.Error(), nil)
+}
+
+func copyStringSet(source map[string]struct{}) map[string]struct{} {
+	copySet := make(map[string]struct{}, len(source))
+	for value := range source {
+		copySet[value] = struct{}{}
+	}
+	return copySet
 }
 
 func (s *Server) callDynamicPrompt(ctx context.Context, promptDef types.PromptDefinition, args map[string]interface{}, respErrPtr **types.ResponseError) (interface{}, error) {
@@ -1557,45 +1807,6 @@ func (s *Server) healthCheckHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("OK"))
-	}
-}
-
-func (s *Server) addSubscriber(ch chan []byte) {
-	s.subscribersMu.Lock()
-	defer s.subscribersMu.Unlock()
-	s.eventSubscribers[ch] = true
-	s.logger.Info("Added new event subscriber")
-}
-
-func (s *Server) removeSubscriber(ch chan []byte) {
-	s.subscribersMu.Lock()
-	defer s.subscribersMu.Unlock()
-	delete(s.eventSubscribers, ch)
-	close(ch)
-	s.logger.Info("Removed event subscriber")
-}
-
-func (s *Server) PublishNotification(method string, params interface{}) {
-	s.subscribersMu.RLock()
-	defer s.subscribersMu.RUnlock()
-
-	notification := types.Request{
-		JSONRPC: "2.0",
-		Method:  method,
-	}
-	if params != nil {
-		paramBytes, _ := json.Marshal(params)
-		notification.Params = json.RawMessage(paramBytes)
-	}
-	notificationBytes, _ := json.Marshal(notification)
-
-	s.logger.Info("Publishing notification", zap.String("method", method), zap.Int("subscriberCount", len(s.eventSubscribers)))
-	for ch := range s.eventSubscribers {
-		select {
-		case ch <- notificationBytes:
-		default:
-			// Don't block if the channel is full
-		}
 	}
 }
 
