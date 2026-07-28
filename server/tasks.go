@@ -10,7 +10,7 @@ import (
 	"github.com/hawoond/gomcp/internal/types"
 )
 
-func (s *Server) startToolTask(tool Tool, arguments map[string]interface{}, requestedTTL int64) (*types.Task, error) {
+func (s *Server) startToolTask(requestContext context.Context, tool Tool, arguments map[string]interface{}, requestedTTL int64) (*types.Task, error) {
 	now := time.Now().UTC()
 
 	s.tasksMu.Lock()
@@ -39,10 +39,12 @@ func (s *Server) startToolTask(tool Tool, arguments map[string]interface{}, requ
 	s.tasks[task.ID] = task
 	s.taskCancels[task.ID] = cancel
 	s.taskExpires[task.ID] = now.Add(ttl)
+	s.taskSessions[task.ID] = sessionIDFromContext(requestContext)
+	s.taskNotifiers[task.ID] = notificationSenderFromContext(requestContext)
 	taskCopy := *task
 	s.tasksMu.Unlock()
 
-	s.PublishNotification("notifications/tasks/status", taskCopy)
+	s.publishTaskStatus(task.ID, taskCopy)
 	go s.runToolTask(ctx, task.ID, tool, arguments)
 	return &taskCopy, nil
 }
@@ -75,29 +77,29 @@ func (s *Server) runToolTask(ctx context.Context, taskID string, tool Tool, argu
 	taskCopy := *task
 	s.tasksMu.Unlock()
 
-	s.PublishNotification("notifications/tasks/status", taskCopy)
+	s.publishTaskStatus(task.ID, taskCopy)
 }
 
-func (s *Server) getTask(taskID string) (*types.Task, error) {
+func (s *Server) getTask(ctx context.Context, taskID string) (*types.Task, error) {
 	now := time.Now().UTC()
 	s.tasksMu.Lock()
 	defer s.tasksMu.Unlock()
 	s.pruneExpiredTasksLocked(now)
 	task, ok := s.tasks[taskID]
-	if !ok {
+	if !ok || s.taskSessions[taskID] != sessionIDFromContext(ctx) {
 		return nil, fmt.Errorf("task not found")
 	}
 	taskCopy := *task
 	return &taskCopy, nil
 }
 
-func (s *Server) getTaskResult(taskID string) (interface{}, error) {
+func (s *Server) getTaskResult(ctx context.Context, taskID string) (interface{}, error) {
 	now := time.Now().UTC()
 	s.tasksMu.Lock()
 	defer s.tasksMu.Unlock()
 	s.pruneExpiredTasksLocked(now)
 	task, ok := s.tasks[taskID]
-	if !ok {
+	if !ok || s.taskSessions[taskID] != sessionIDFromContext(ctx) {
 		return nil, fmt.Errorf("task not found")
 	}
 	if task.Status == types.TaskStatusWorking || task.Status == types.TaskStatusInputRequired {
@@ -113,10 +115,10 @@ func (s *Server) getTaskResult(taskID string) (interface{}, error) {
 	return result, nil
 }
 
-func (s *Server) cancelTask(taskID string) (*types.Task, error) {
+func (s *Server) cancelTask(ctx context.Context, taskID string) (*types.Task, error) {
 	s.tasksMu.Lock()
 	task, ok := s.tasks[taskID]
-	if !ok {
+	if !ok || s.taskSessions[taskID] != sessionIDFromContext(ctx) {
 		s.tasksMu.Unlock()
 		return nil, fmt.Errorf("task not found")
 	}
@@ -135,34 +137,31 @@ func (s *Server) cancelTask(taskID string) (*types.Task, error) {
 	taskCopy := *task
 	s.tasksMu.Unlock()
 
-	s.PublishNotification("notifications/tasks/status", taskCopy)
+	s.publishTaskStatus(task.ID, taskCopy)
 	return &taskCopy, nil
 }
 
-func (s *Server) listTasks(cursor string) ([]types.Task, string) {
+func (s *Server) listTasks(ctx context.Context, cursor string) ([]types.Task, string, error) {
 	now := time.Now().UTC()
 	s.tasksMu.Lock()
-	defer s.tasksMu.Unlock()
 	s.pruneExpiredTasksLocked(now)
 
 	ids := make([]string, 0, len(s.tasks))
 	for taskID := range s.tasks {
-		if cursor == "" || taskID > cursor {
+		if s.taskSessions[taskID] == sessionIDFromContext(ctx) {
 			ids = append(ids, taskID)
 		}
 	}
 	sort.Strings(ids)
-	const pageSize = 100
-	nextCursor := ""
-	if len(ids) > pageSize {
-		nextCursor = ids[pageSize-1]
-		ids = ids[:pageSize]
-	}
 	tasks := make([]types.Task, 0, len(ids))
 	for _, taskID := range ids {
 		tasks = append(tasks, *s.tasks[taskID])
 	}
-	return tasks, nextCursor
+	s.tasksMu.Unlock()
+	s.rwMu.RLock()
+	pageSize := s.pageSize
+	s.rwMu.RUnlock()
+	return paginate(tasks, cursor, pageSize)
 }
 
 func (s *Server) pruneExpiredTasksLocked(now time.Time) {
@@ -177,5 +176,24 @@ func (s *Server) pruneExpiredTasksLocked(now time.Time) {
 		delete(s.taskResults, taskID)
 		delete(s.taskCancels, taskID)
 		delete(s.taskExpires, taskID)
+		delete(s.taskSessions, taskID)
+		delete(s.taskNotifiers, taskID)
+	}
+}
+
+func (s *Server) publishTaskStatus(taskID string, task types.Task) {
+	s.tasksMu.RLock()
+	sessionID := s.taskSessions[taskID]
+	notifier := s.taskNotifiers[taskID]
+	s.tasksMu.RUnlock()
+	if notifier != nil {
+		_ = notifier("notifications/tasks/status", task)
+		return
+	}
+	if sessionID == "" {
+		return
+	}
+	if session, ok := s.session(sessionID); ok {
+		s.publishToSession(session, "notifications/tasks/status", task)
 	}
 }

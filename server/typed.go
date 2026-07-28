@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+
+	"github.com/hawoond/gomcp/internal/types"
 )
 
 func RegisterTool[Input any, Output any](
@@ -44,6 +46,7 @@ func registerTypedTool[Input any, Output any](
 	}
 
 	inputType := reflect.TypeOf((*Input)(nil)).Elem()
+	outputType := reflect.TypeOf((*Output)(nil)).Elem()
 	schema := schemaForType(inputType, make(map[reflect.Type]bool))
 	if schema["type"] != "object" {
 		schema = map[string]interface{}{
@@ -55,11 +58,22 @@ func registerTypedTool[Input any, Output any](
 		}
 	}
 
+	var outputSchema map[string]interface{}
+	callToolResultType := reflect.TypeOf((*types.CallToolResult)(nil)).Elem()
+	comparableOutputType := outputType
+	for comparableOutputType.Kind() == reflect.Pointer {
+		comparableOutputType = comparableOutputType.Elem()
+	}
+	if comparableOutputType != callToolResultType {
+		outputSchema = schemaForType(outputType, make(map[reflect.Type]bool))
+	}
+
 	tool := Tool{
-		Name:        name,
-		Description: description,
-		InputSchema: schema,
-		TaskSupport: taskSupport,
+		Name:         name,
+		Description:  description,
+		InputSchema:  schema,
+		OutputSchema: outputSchema,
+		TaskSupport:  taskSupport,
 		Handler: func(ctx context.Context, arguments map[string]interface{}) (interface{}, error) {
 			var input Input
 			encoded, err := json.Marshal(arguments)
@@ -77,11 +91,13 @@ func registerTypedTool[Input any, Output any](
 	}
 
 	server.rwMu.Lock()
-	defer server.rwMu.Unlock()
 	if _, exists := server.tools[name]; exists {
+		server.rwMu.Unlock()
 		return fmt.Errorf("tool %q is already registered", name)
 	}
 	server.tools[name] = tool
+	server.rwMu.Unlock()
+	server.PublishNotification("notifications/tools/list_changed", nil)
 	return nil
 }
 

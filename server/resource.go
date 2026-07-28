@@ -39,28 +39,22 @@ func resourceResult(uri string, result interface{}) (types.ReadResourceResult, e
 	case types.ReadResourceResult:
 		return value, nil
 	case types.Content:
-		if value.URI == "" {
-			value.URI = uri
-		}
-		return types.ReadResourceResult{Contents: []types.Content{value}}, nil
+		return types.ReadResourceResult{Contents: []types.ResourceContents{contentToResource(uri, value)}}, nil
 	case []types.Content:
+		contents := make([]types.ResourceContents, len(value))
 		for index := range value {
-			if value[index].URI == "" {
-				value[index].URI = uri
-			}
+			contents[index] = contentToResource(uri, value[index])
 		}
-		return types.ReadResourceResult{Contents: value}, nil
+		return types.ReadResourceResult{Contents: contents}, nil
 	case []byte:
-		return types.ReadResourceResult{Contents: []types.Content{{
+		return types.ReadResourceResult{Contents: []types.ResourceContents{{
 			URI:      uri,
-			Type:     "blob",
-			Data:     base64.StdEncoding.EncodeToString(value),
+			Blob:     base64.StdEncoding.EncodeToString(value),
 			MimeType: "application/octet-stream",
 		}}}, nil
 	case string:
-		return types.ReadResourceResult{Contents: []types.Content{{
+		return types.ReadResourceResult{Contents: []types.ResourceContents{{
 			URI:      uri,
-			Type:     "text",
 			Text:     value,
 			MimeType: "text/plain",
 		}}}, nil
@@ -69,13 +63,29 @@ func resourceResult(uri string, result interface{}) (types.ReadResourceResult, e
 		if err != nil {
 			return types.ReadResourceResult{}, fmt.Errorf("encode resource result: %w", err)
 		}
-		return types.ReadResourceResult{Contents: []types.Content{{
+		return types.ReadResourceResult{Contents: []types.ResourceContents{{
 			URI:      uri,
-			Type:     "text",
 			Text:     string(encoded),
 			MimeType: "application/json",
 		}}}, nil
 	}
+}
+
+func contentToResource(uri string, content types.Content) types.ResourceContents {
+	if content.URI != "" {
+		uri = content.URI
+	}
+	resource := types.ResourceContents{
+		URI:      uri,
+		MimeType: content.MimeType,
+		Text:     content.Text,
+		Meta:     content.Meta,
+	}
+	if content.Type == "blob" || content.Data != "" {
+		resource.Blob = content.Data
+		resource.Text = ""
+	}
+	return resource
 }
 
 func convertString(value string, target reflect.Type) (reflect.Value, error) {

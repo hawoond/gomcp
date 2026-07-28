@@ -21,25 +21,32 @@ jobs:
           - "1.25.12"
           - "1.26.5"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: ${{ matrix.go }}
           cache: true
-      - run: go test ./...
+      - run: go test -shuffle=on -count=1 ./...
       - run: go test -race ./...
       - run: go vet ./...
 
   quality:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: "1.26.5"
           cache: true
       - name: Check formatting
         run: test -z "$(gofmt -l .)"
+      - name: Static analysis
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.7.0 ./...
+      - name: Check coverage floor
+        run: |
+          go test ./... -coverprofile=coverage.out
+          go tool cover -func=coverage.out |
+            awk '/^total:/ { gsub("%", "", $3); if ($3 < 50) exit 1 }'
       - name: Fuzz URI templates
         run: go test ./internal/util -run=^$ -fuzz=FuzzMatchURI -fuzztime=5s
       - name: Vulnerability scan

@@ -22,6 +22,7 @@ const (
 	ProtocolVersion20250326 = "2025-03-26"
 	ProtocolVersion20250618 = "2025-06-18"
 	ProtocolVersion20251125 = "2025-11-25"
+	ProtocolVersion20260728 = "2026-07-28"
 	LatestProtocolVersion   = ProtocolVersion20251125
 )
 
@@ -46,17 +47,44 @@ type ResponseError struct {
 }
 
 type Content struct {
-	Type      string `json:"type"`
-	Text      string `json:"text,omitempty"`
-	Data      string `json:"data,omitempty"`
-	MimeType  string `json:"mimeType,omitempty"`
-	URI       string `json:"uri,omitempty"`
-	IsPartial bool   `json:"isPartial,omitempty"`
+	Type        string                 `json:"type"`
+	Text        string                 `json:"text,omitempty"`
+	Data        string                 `json:"data,omitempty"`
+	MimeType    string                 `json:"mimeType,omitempty"`
+	URI         string                 `json:"uri,omitempty"`
+	Name        string                 `json:"name,omitempty"`
+	Title       string                 `json:"title,omitempty"`
+	Description string                 `json:"description,omitempty"`
+	Size        *int64                 `json:"size,omitempty"`
+	Annotations *Annotations           `json:"annotations,omitempty"`
+	Meta        map[string]interface{} `json:"_meta,omitempty"`
+	IsPartial   bool                   `json:"isPartial,omitempty"`
 }
 
 type Message struct {
 	Role    string  `json:"role"`
 	Content Content `json:"content"`
+}
+
+type Annotations struct {
+	Audience     []string `json:"audience,omitempty"`
+	Priority     *float64 `json:"priority,omitempty"`
+	LastModified string   `json:"lastModified,omitempty"`
+}
+
+type Icon struct {
+	Source   string   `json:"src"`
+	MimeType string   `json:"mimeType,omitempty"`
+	Sizes    []string `json:"sizes,omitempty"`
+	Theme    string   `json:"theme,omitempty"`
+}
+
+type ToolAnnotations struct {
+	Title           string `json:"title,omitempty"`
+	ReadOnlyHint    *bool  `json:"readOnlyHint,omitempty"`
+	DestructiveHint *bool  `json:"destructiveHint,omitempty"`
+	IdempotentHint  *bool  `json:"idempotentHint,omitempty"`
+	OpenWorldHint   *bool  `json:"openWorldHint,omitempty"`
 }
 
 type CallToolResult struct {
@@ -67,12 +95,203 @@ type CallToolResult struct {
 }
 
 type ReadResourceResult struct {
-	Contents []Content `json:"contents"`
+	Contents []ResourceContents     `json:"contents"`
+	Meta     map[string]interface{} `json:"_meta,omitempty"`
 }
 
 type GetPromptResult struct {
-	Description string    `json:"description,omitempty"`
-	Messages    []Message `json:"messages"`
+	Description string                 `json:"description,omitempty"`
+	Messages    []Message              `json:"messages"`
+	Meta        map[string]interface{} `json:"_meta,omitempty"`
+}
+
+type ResourceContents struct {
+	URI      string                 `json:"uri"`
+	MimeType string                 `json:"mimeType,omitempty"`
+	Text     string                 `json:"text,omitempty"`
+	Blob     string                 `json:"blob,omitempty"`
+	Meta     map[string]interface{} `json:"_meta,omitempty"`
+}
+
+type ResourceInfo struct {
+	URI         string                 `json:"uri"`
+	Name        string                 `json:"name"`
+	Title       string                 `json:"title,omitempty"`
+	Description string                 `json:"description,omitempty"`
+	MimeType    string                 `json:"mimeType,omitempty"`
+	Size        *int64                 `json:"size,omitempty"`
+	Icons       []Icon                 `json:"icons,omitempty"`
+	Annotations *Annotations           `json:"annotations,omitempty"`
+	Meta        map[string]interface{} `json:"_meta,omitempty"`
+}
+
+type ResourceTemplate struct {
+	URITemplate string                 `json:"uriTemplate"`
+	Name        string                 `json:"name"`
+	Title       string                 `json:"title,omitempty"`
+	Description string                 `json:"description,omitempty"`
+	MimeType    string                 `json:"mimeType,omitempty"`
+	Icons       []Icon                 `json:"icons,omitempty"`
+	Annotations *Annotations           `json:"annotations,omitempty"`
+	Meta        map[string]interface{} `json:"_meta,omitempty"`
+}
+
+type PromptInfo struct {
+	Name        string                 `json:"name"`
+	Title       string                 `json:"title,omitempty"`
+	Description string                 `json:"description,omitempty"`
+	Arguments   []PromptArgument       `json:"arguments,omitempty"`
+	Icons       []Icon                 `json:"icons,omitempty"`
+	Meta        map[string]interface{} `json:"_meta,omitempty"`
+}
+
+type PromptArgument struct {
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	Required    bool   `json:"required,omitempty"`
+}
+
+type ToolInfo struct {
+	Name         string                 `json:"name"`
+	Title        string                 `json:"title,omitempty"`
+	Description  string                 `json:"description,omitempty"`
+	InputSchema  interface{}            `json:"inputSchema"`
+	OutputSchema interface{}            `json:"outputSchema,omitempty"`
+	Annotations  *ToolAnnotations       `json:"annotations,omitempty"`
+	Icons        []Icon                 `json:"icons,omitempty"`
+	Meta         map[string]interface{} `json:"_meta,omitempty"`
+	Execution    map[string]interface{} `json:"execution,omitempty"`
+}
+
+type PaginatedParams struct {
+	Cursor string `json:"cursor,omitempty"`
+}
+
+type ListToolsResult struct {
+	Tools      []ToolInfo             `json:"tools"`
+	NextCursor string                 `json:"nextCursor,omitempty"`
+	Meta       map[string]interface{} `json:"_meta,omitempty"`
+}
+
+type ListResourcesResult struct {
+	Resources  []ResourceInfo         `json:"resources"`
+	NextCursor string                 `json:"nextCursor,omitempty"`
+	Meta       map[string]interface{} `json:"_meta,omitempty"`
+}
+
+type ListResourceTemplatesResult struct {
+	ResourceTemplates []ResourceTemplate     `json:"resourceTemplates"`
+	NextCursor        string                 `json:"nextCursor,omitempty"`
+	Meta              map[string]interface{} `json:"_meta,omitempty"`
+}
+
+type ListPromptsResult struct {
+	Prompts    []PromptInfo           `json:"prompts"`
+	NextCursor string                 `json:"nextCursor,omitempty"`
+	Meta       map[string]interface{} `json:"_meta,omitempty"`
+}
+
+type CompleteParams struct {
+	Ref      map[string]interface{} `json:"ref"`
+	Argument CompleteArgument       `json:"argument"`
+	Context  map[string]interface{} `json:"context,omitempty"`
+}
+
+type CompleteArgument struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
+
+type Completion struct {
+	Values  []string `json:"values"`
+	Total   *int     `json:"total,omitempty"`
+	HasMore *bool    `json:"hasMore,omitempty"`
+}
+
+type CompleteResult struct {
+	Completion Completion             `json:"completion"`
+	Meta       map[string]interface{} `json:"_meta,omitempty"`
+}
+
+type CancelledParams struct {
+	RequestID json.RawMessage        `json:"requestId"`
+	Reason    string                 `json:"reason,omitempty"`
+	Meta      map[string]interface{} `json:"_meta,omitempty"`
+}
+
+type ProgressParams struct {
+	ProgressToken interface{}            `json:"progressToken"`
+	Progress      float64                `json:"progress"`
+	Total         *float64               `json:"total,omitempty"`
+	Message       string                 `json:"message,omitempty"`
+	Meta          map[string]interface{} `json:"_meta,omitempty"`
+}
+
+type ElicitParams struct {
+	Mode            string                 `json:"mode"`
+	Message         string                 `json:"message"`
+	RequestedSchema map[string]interface{} `json:"requestedSchema,omitempty"`
+	URL             string                 `json:"url,omitempty"`
+	ElicitationID   string                 `json:"elicitationId,omitempty"`
+	Meta            map[string]interface{} `json:"_meta,omitempty"`
+}
+
+type ElicitResult struct {
+	Action  string                 `json:"action"`
+	Content map[string]interface{} `json:"content,omitempty"`
+	Meta    map[string]interface{} `json:"_meta,omitempty"`
+}
+
+type Root struct {
+	URI  string `json:"uri"`
+	Name string `json:"name,omitempty"`
+}
+
+type ListRootsResult struct {
+	Roots []Root                 `json:"roots"`
+	Meta  map[string]interface{} `json:"_meta,omitempty"`
+}
+
+type ModelHint struct {
+	Name string `json:"name,omitempty"`
+}
+
+type ModelPreferences struct {
+	Hints                []ModelHint `json:"hints,omitempty"`
+	CostPriority         *float64    `json:"costPriority,omitempty"`
+	SpeedPriority        *float64    `json:"speedPriority,omitempty"`
+	IntelligencePriority *float64    `json:"intelligencePriority,omitempty"`
+}
+
+type SamplingMessage struct {
+	Role    string  `json:"role"`
+	Content Content `json:"content"`
+}
+
+type CreateMessageParams struct {
+	Messages         []SamplingMessage      `json:"messages"`
+	ModelPreferences *ModelPreferences      `json:"modelPreferences,omitempty"`
+	SystemPrompt     string                 `json:"systemPrompt,omitempty"`
+	IncludeContext   string                 `json:"includeContext,omitempty"`
+	Temperature      *float64               `json:"temperature,omitempty"`
+	MaxTokens        int                    `json:"maxTokens"`
+	StopSequences    []string               `json:"stopSequences,omitempty"`
+	Metadata         map[string]interface{} `json:"metadata,omitempty"`
+	Meta             map[string]interface{} `json:"_meta,omitempty"`
+}
+
+type CreateMessageResult struct {
+	Role       string                 `json:"role"`
+	Content    Content                `json:"content"`
+	Model      string                 `json:"model"`
+	StopReason string                 `json:"stopReason,omitempty"`
+	Meta       map[string]interface{} `json:"_meta,omitempty"`
+}
+
+type LoggingMessageParams struct {
+	Level  string      `json:"level"`
+	Logger string      `json:"logger,omitempty"`
+	Data   interface{} `json:"data"`
 }
 
 type CustomError struct {

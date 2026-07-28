@@ -20,6 +20,7 @@ govulncheck ./...
 ## Pull requests
 
 - Keep protocol changes aligned with a named MCP specification version.
+- Derive behavior from published protocol contracts and interoperability tests.
 - Add tests for success, malformed input, cancellation, and concurrency paths.
 - Preserve compatibility aliases when a safe migration path is possible.
 - Document public API and behavior changes in `README.md` and `CHANGELOG.md`.

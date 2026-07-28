@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/hawoond/gomcp/auth"
 	"github.com/hawoond/gomcp/internal/types"
 	"go.uber.org/zap"
 )
@@ -60,6 +61,117 @@ func (s *Server) SetTaskPolicy(ttl time.Duration, maxTasks int) error {
 	s.maxTasks = maxTasks
 	s.tasksMu.Unlock()
 	return nil
+}
+
+func (s *Server) SetPageSize(pageSize int) error {
+	if pageSize <= 0 {
+		return fmt.Errorf("page size must be positive")
+	}
+	s.rwMu.Lock()
+	s.pageSize = pageSize
+	s.rwMu.Unlock()
+	return nil
+}
+
+func (s *Server) SetSessionPolicy(ttl time.Duration, maxEvents int) error {
+	if ttl <= 0 || maxEvents <= 0 {
+		return fmt.Errorf("session TTL and event capacity must be positive")
+	}
+	s.sessionsMu.Lock()
+	s.sessionTTL = ttl
+	s.maxSessionEvents = maxEvents
+	s.sessionsMu.Unlock()
+	return nil
+}
+
+func (s *Server) SetStatelessHTTP(enabled bool) {
+	s.rwMu.Lock()
+	s.statelessHTTP = enabled
+	s.rwMu.Unlock()
+}
+
+func (s *Server) SetCompletionHandler(handler CompletionHandler) {
+	s.rwMu.Lock()
+	s.completionHandler = handler
+	s.rwMu.Unlock()
+}
+
+func (s *Server) SetToolMetadata(name, title string, annotations *types.ToolAnnotations, icons ...types.Icon) error {
+	s.rwMu.Lock()
+	tool, ok := s.tools[name]
+	if !ok {
+		s.rwMu.Unlock()
+		return fmt.Errorf("tool %q is not registered", name)
+	}
+	tool.Title = title
+	if annotations != nil {
+		copyAnnotations := *annotations
+		tool.Annotations = &copyAnnotations
+	} else {
+		tool.Annotations = nil
+	}
+	tool.Icons = append([]types.Icon(nil), icons...)
+	s.tools[name] = tool
+	s.rwMu.Unlock()
+	s.PublishNotification("notifications/tools/list_changed", nil)
+	return nil
+}
+
+func (s *Server) SetResourceMetadata(uri, name, title, mimeType string, annotations *types.Annotations, icons ...types.Icon) error {
+	s.rwMu.Lock()
+	for index := range s.resources {
+		if s.resources[index].URITemplate != uri {
+			continue
+		}
+		s.resources[index].Name = name
+		s.resources[index].Title = title
+		s.resources[index].MimeType = mimeType
+		if annotations != nil {
+			copyAnnotations := *annotations
+			copyAnnotations.Audience = append([]string(nil), annotations.Audience...)
+			s.resources[index].Annotations = &copyAnnotations
+		} else {
+			s.resources[index].Annotations = nil
+		}
+		s.resources[index].Icons = append([]types.Icon(nil), icons...)
+		s.rwMu.Unlock()
+		s.PublishNotification("notifications/resources/list_changed", nil)
+		return nil
+	}
+	s.rwMu.Unlock()
+	return fmt.Errorf("resource %q is not registered", uri)
+}
+
+func (s *Server) SetPromptMetadata(name, title string, icons ...types.Icon) error {
+	s.rwMu.Lock()
+	prompt, ok := s.prompts[name]
+	if !ok {
+		s.rwMu.Unlock()
+		return fmt.Errorf("prompt %q is not registered", name)
+	}
+	prompt.Title = title
+	prompt.Icons = append([]types.Icon(nil), icons...)
+	s.prompts[name] = prompt
+	s.rwMu.Unlock()
+	s.PublishNotification("notifications/prompts/list_changed", nil)
+	return nil
+}
+
+func (s *Server) SetBearerTokenVerifier(verifier auth.TokenVerifier, requiredScopes ...string) {
+	s.rwMu.Lock()
+	s.bearerVerifier = verifier
+	s.requiredScopes = append([]string(nil), requiredScopes...)
+	s.rwMu.Unlock()
+}
+
+func (s *Server) SetProtectedResourceMetadata(metadata auth.ProtectedResourceMetadata) {
+	s.rwMu.Lock()
+	copyMetadata := metadata
+	copyMetadata.AuthorizationServers = append([]string(nil), metadata.AuthorizationServers...)
+	copyMetadata.ScopesSupported = append([]string(nil), metadata.ScopesSupported...)
+	copyMetadata.BearerMethods = append([]string(nil), metadata.BearerMethods...)
+	s.protectedResourceMetadata = &copyMetadata
+	s.rwMu.Unlock()
 }
 
 func (s *Server) AllowOrigin(origins ...string) error {
@@ -121,8 +233,9 @@ func (s *Server) AddDynamicTool(definition types.ToolDefinition) error {
 		return fmt.Errorf("tool name is required")
 	}
 	s.rwMu.Lock()
-	defer s.rwMu.Unlock()
 	s.dynamicTools[definition.Name] = definition
+	s.rwMu.Unlock()
+	s.PublishNotification("notifications/tools/list_changed", nil)
 	return nil
 }
 
@@ -134,8 +247,9 @@ func (s *Server) AddDynamicPrompt(definition types.PromptDefinition) error {
 		return fmt.Errorf("prompt name is required")
 	}
 	s.rwMu.Lock()
-	defer s.rwMu.Unlock()
 	s.dynamicPrompts[definition.Name] = definition
+	s.rwMu.Unlock()
+	s.PublishNotification("notifications/prompts/list_changed", nil)
 	return nil
 }
 

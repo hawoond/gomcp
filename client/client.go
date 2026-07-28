@@ -15,10 +15,17 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hawoond/gomcp/auth"
 	"github.com/hawoond/gomcp/protocol"
 )
 
 type NotificationHandler func(method string, params json.RawMessage)
+type RequestHandler func(context.Context, string, json.RawMessage) (interface{}, error)
+
+type stdioResult struct {
+	response protocol.Response
+	err      error
+}
 
 type Client struct {
 	stateMu             sync.RWMutex
@@ -33,14 +40,24 @@ type Client struct {
 	protocolVersion     string
 	initialized         bool
 	apiKey              string
+	tokenSource         auth.TokenSource
 	httpClient          *http.Client
 	maxResponseBytes    int64
 	nextID              int64
 	idMu                sync.Mutex
-	stdioMu             sync.Mutex
+	stdioWriteMu        sync.Mutex
+	pendingMu           sync.Mutex
+	pending             map[string]chan stdioResult
+	readerDone          chan struct{}
+	readerErrMu         sync.RWMutex
+	readerErr           error
 	initMu              sync.Mutex
 	notificationMu      sync.RWMutex
 	notificationHandler NotificationHandler
+	requestMu           sync.RWMutex
+	requestHandler      RequestHandler
+	requestHandlers     map[string]RequestHandler
+	lastEventID         string
 }
 
 func NewClient() *Client {
@@ -49,6 +66,8 @@ func NewClient() *Client {
 		httpClient:       &http.Client{Timeout: 30 * time.Second},
 		maxResponseBytes: 4 << 20,
 		protocolVersion:  protocol.LatestProtocolVersion,
+		pending:          make(map[string]chan stdioResult),
+		requestHandlers:  make(map[string]RequestHandler),
 	}
 }
 
@@ -64,6 +83,18 @@ func (c *Client) SetHTTPClient(client *http.Client) {
 func (c *Client) SetAPIKey(apiKey string) {
 	c.stateMu.Lock()
 	c.apiKey = apiKey
+	c.stateMu.Unlock()
+}
+
+func (c *Client) SetBearerToken(token string) {
+	c.SetTokenSource(auth.TokenSourceFunc(func(context.Context) (string, error) {
+		return token, nil
+	}))
+}
+
+func (c *Client) SetTokenSource(source auth.TokenSource) {
+	c.stateMu.Lock()
+	c.tokenSource = source
 	c.stateMu.Unlock()
 }
 
@@ -112,9 +143,16 @@ func (c *Client) StartProcessContext(ctx context.Context, command string, args .
 	c.stdin = stdin
 	c.stdioEncoder = json.NewEncoder(stdin)
 	c.stdioDecoder = json.NewDecoder(stdout)
+	c.readerDone = make(chan struct{})
+	c.readerErr = nil
+	c.pending = make(map[string]chan stdioResult)
 	c.initialized = false
 	c.sessionID = ""
+	c.lastEventID = ""
+	decoder := c.stdioDecoder
+	readerDone := c.readerDone
 	c.stateMu.Unlock()
+	go c.readStdio(decoder, readerDone)
 	return nil
 }
 
@@ -178,6 +216,7 @@ func (c *Client) ConnectHTTP(baseURL string) {
 	c.transport = "http"
 	c.baseURL = strings.TrimRight(baseURL, "/")
 	c.sessionID = ""
+	c.lastEventID = ""
 	c.initialized = false
 	c.stateMu.Unlock()
 }
@@ -196,13 +235,25 @@ func (c *Client) initializeLocked(ctx context.Context, clientName string, client
 	if protocolVersion == "" {
 		protocolVersion = protocol.LatestProtocolVersion
 	}
+	c.requestMu.RLock()
+	capabilities := make(map[string]interface{})
+	if c.requestHandlers["roots/list"] != nil {
+		capabilities["roots"] = map[string]interface{}{"listChanged": true}
+	}
+	if c.requestHandlers["sampling/createMessage"] != nil {
+		capabilities["sampling"] = map[string]interface{}{}
+	}
+	if c.requestHandlers["elicitation/create"] != nil {
+		capabilities["elicitation"] = map[string]interface{}{}
+	}
+	c.requestMu.RUnlock()
 	params := map[string]interface{}{
 		"protocolVersion": protocolVersion,
 		"clientInfo": map[string]string{
 			"name":    clientName,
 			"version": clientVersion,
 		},
-		"capabilities": map[string]interface{}{},
+		"capabilities": capabilities,
 	}
 	var result struct {
 		ProtocolVersion string `json:"protocolVersion"`
@@ -245,27 +296,103 @@ func (c *Client) ensureInitialized(ctx context.Context) error {
 }
 
 func (c *Client) ListTools() ([]map[string]interface{}, error) {
-	var result struct {
-		Tools []map[string]interface{} `json:"tools"`
+	var tools []map[string]interface{}
+	cursor := ""
+	for {
+		var result struct {
+			Tools      []map[string]interface{} `json:"tools"`
+			NextCursor string                   `json:"nextCursor"`
+		}
+		if err := c.Call("tools/list", map[string]interface{}{"cursor": cursor}, &result); err != nil {
+			return nil, err
+		}
+		tools = append(tools, result.Tools...)
+		if result.NextCursor == "" {
+			return tools, nil
+		}
+		cursor = result.NextCursor
 	}
-	err := c.Call("tools/list", map[string]interface{}{}, &result)
-	return result.Tools, err
 }
 
 func (c *Client) ListPrompts() ([]map[string]interface{}, error) {
-	var result struct {
-		Prompts []map[string]interface{} `json:"prompts"`
+	var prompts []map[string]interface{}
+	cursor := ""
+	for {
+		var result struct {
+			Prompts    []map[string]interface{} `json:"prompts"`
+			NextCursor string                   `json:"nextCursor"`
+		}
+		if err := c.Call("prompts/list", map[string]interface{}{"cursor": cursor}, &result); err != nil {
+			return nil, err
+		}
+		prompts = append(prompts, result.Prompts...)
+		if result.NextCursor == "" {
+			return prompts, nil
+		}
+		cursor = result.NextCursor
 	}
-	err := c.Call("prompts/list", map[string]interface{}{}, &result)
-	return result.Prompts, err
 }
 
 func (c *Client) ListResources() ([]map[string]interface{}, error) {
-	var result struct {
-		Resources []map[string]interface{} `json:"resources"`
+	var resources []map[string]interface{}
+	cursor := ""
+	for {
+		var result struct {
+			Resources  []map[string]interface{} `json:"resources"`
+			NextCursor string                   `json:"nextCursor"`
+		}
+		if err := c.Call("resources/list", map[string]interface{}{"cursor": cursor}, &result); err != nil {
+			return nil, err
+		}
+		resources = append(resources, result.Resources...)
+		if result.NextCursor == "" {
+			return resources, nil
+		}
+		cursor = result.NextCursor
 	}
-	err := c.Call("resources/list", map[string]interface{}{}, &result)
-	return result.Resources, err
+}
+
+func (c *Client) ListResourceTemplates() ([]protocol.ResourceTemplate, error) {
+	var templates []protocol.ResourceTemplate
+	cursor := ""
+	for {
+		var result protocol.ListResourceTemplatesResult
+		if err := c.Call("resources/templates/list", map[string]interface{}{"cursor": cursor}, &result); err != nil {
+			return nil, err
+		}
+		templates = append(templates, result.ResourceTemplates...)
+		if result.NextCursor == "" {
+			return templates, nil
+		}
+		cursor = result.NextCursor
+	}
+}
+
+func (c *Client) Ping() error {
+	return c.Call("ping", map[string]interface{}{}, nil)
+}
+
+func (c *Client) Complete(params protocol.CompleteParams) (protocol.CompleteResult, error) {
+	var result protocol.CompleteResult
+	err := c.Call("completion/complete", params, &result)
+	return result, err
+}
+
+func (c *Client) SubscribeResource(uri string) error {
+	return c.Call("resources/subscribe", map[string]string{"uri": uri}, nil)
+}
+
+func (c *Client) UnsubscribeResource(uri string) error {
+	return c.Call("resources/unsubscribe", map[string]string{"uri": uri}, nil)
+}
+
+func (c *Client) NotifyProgress(progressToken interface{}, progress float64, total *float64, message string) error {
+	return c.Notify("notifications/progress", protocol.ProgressParams{
+		ProgressToken: progressToken,
+		Progress:      progress,
+		Total:         total,
+		Message:       message,
+	})
 }
 
 func (c *Client) Call(method string, params interface{}, result interface{}) error {
@@ -336,40 +463,53 @@ func (c *Client) exchange(ctx context.Context, request protocol.Request) (protoc
 }
 
 func (c *Client) exchangeStdio(ctx context.Context, request protocol.Request) (protocol.Response, error) {
-	c.stdioMu.Lock()
-	defer c.stdioMu.Unlock()
-
 	c.stateMu.RLock()
 	encoder := c.stdioEncoder
-	decoder := c.stdioDecoder
+	readerDone := c.readerDone
 	c.stateMu.RUnlock()
-	if encoder == nil || decoder == nil {
+	if encoder == nil || readerDone == nil || request.ID == nil {
 		return protocol.Response{}, fmt.Errorf("stdio transport is not running")
 	}
 	if err := ctx.Err(); err != nil {
 		return protocol.Response{}, err
 	}
-	if err := encoder.Encode(request); err != nil {
+	requestID := string(*request.ID)
+	responseChannel := make(chan stdioResult, 1)
+	c.pendingMu.Lock()
+	c.pending[requestID] = responseChannel
+	c.pendingMu.Unlock()
+
+	c.stdioWriteMu.Lock()
+	err := encoder.Encode(request)
+	c.stdioWriteMu.Unlock()
+	if err != nil {
+		c.removePending(requestID)
 		return protocol.Response{}, err
 	}
-	for {
-		var raw json.RawMessage
-		if err := decoder.Decode(&raw); err != nil {
-			return protocol.Response{}, err
+
+	select {
+	case result := <-responseChannel:
+		return result.response, result.err
+	case <-ctx.Done():
+		c.removePending(requestID)
+		_ = c.writeStdio(protocol.Request{
+			JSONRPC: "2.0",
+			Method:  "notifications/cancelled",
+			Params: mustMarshal(map[string]interface{}{
+				"requestId": json.RawMessage(*request.ID),
+				"reason":    ctx.Err().Error(),
+			}),
+		})
+		return protocol.Response{}, ctx.Err()
+	case <-readerDone:
+		c.removePending(requestID)
+		c.readerErrMu.RLock()
+		readerErr := c.readerErr
+		c.readerErrMu.RUnlock()
+		if readerErr == nil {
+			readerErr = io.EOF
 		}
-		var notification protocol.Request
-		if err := json.Unmarshal(raw, &notification); err == nil && notification.ID == nil && notification.Method != "" {
-			c.dispatchNotification(notification.Method, notification.Params)
-			continue
-		}
-		var response protocol.Response
-		if err := json.Unmarshal(raw, &response); err != nil {
-			return protocol.Response{}, fmt.Errorf("decode stdio response: %w", err)
-		}
-		if response.ID == nil || string(*response.ID) != string(*request.ID) {
-			continue
-		}
-		return response, nil
+		return protocol.Response{}, readerErr
 	}
 }
 
@@ -391,6 +531,14 @@ func (c *Client) exchangeHTTP(ctx context.Context, request protocol.Request) (pr
 	c.stateMu.RUnlock()
 	httpResponse, err := client.Do(httpRequest)
 	if err != nil {
+		if ctx.Err() != nil && request.ID != nil {
+			cancelContext, cancel := context.WithTimeout(context.Background(), time.Second)
+			_ = c.notifyRaw(cancelContext, "notifications/cancelled", map[string]interface{}{
+				"requestId": json.RawMessage(*request.ID),
+				"reason":    ctx.Err().Error(),
+			})
+			cancel()
+		}
 		return protocol.Response{}, err
 	}
 	defer httpResponse.Body.Close()
@@ -440,15 +588,7 @@ func (c *Client) notifyRaw(ctx context.Context, method string, params interface{
 	transport := c.transport
 	c.stateMu.RUnlock()
 	if transport == "stdio" {
-		c.stdioMu.Lock()
-		defer c.stdioMu.Unlock()
-		c.stateMu.RLock()
-		encoder := c.stdioEncoder
-		c.stateMu.RUnlock()
-		if encoder == nil {
-			return fmt.Errorf("stdio transport is not running")
-		}
-		return encoder.Encode(request)
+		return c.writeStdio(request)
 	}
 	if transport != "http" {
 		return fmt.Errorf("client not connected")
@@ -509,22 +649,103 @@ func (c *Client) CancelTask(taskID string) (*protocol.Task, error) {
 	return &task, err
 }
 
+func (c *Client) ListTasks() ([]protocol.Task, error) {
+	var tasks []protocol.Task
+	cursor := ""
+	for {
+		var result struct {
+			Tasks      []protocol.Task `json:"tasks"`
+			NextCursor string          `json:"nextCursor"`
+		}
+		if err := c.Call("tasks/list", map[string]interface{}{"cursor": cursor}, &result); err != nil {
+			return nil, err
+		}
+		tasks = append(tasks, result.Tasks...)
+		if result.NextCursor == "" {
+			return tasks, nil
+		}
+		cursor = result.NextCursor
+	}
+}
+
 func (c *Client) HandleNotifications(handler NotificationHandler) {
 	c.notificationMu.Lock()
 	c.notificationHandler = handler
 	c.notificationMu.Unlock()
 }
 
+func (c *Client) HandleRequests(handler RequestHandler) {
+	c.requestMu.Lock()
+	c.requestHandler = handler
+	c.requestMu.Unlock()
+}
+
+func (c *Client) HandleRequest(method string, handler RequestHandler) {
+	c.requestMu.Lock()
+	if handler == nil {
+		delete(c.requestHandlers, method)
+	} else {
+		c.requestHandlers[method] = handler
+	}
+	c.requestMu.Unlock()
+}
+
+func (c *Client) HandleElicitation(handler func(context.Context, protocol.ElicitParams) (protocol.ElicitResult, error)) {
+	if handler == nil {
+		c.HandleRequest("elicitation/create", nil)
+		return
+	}
+	c.HandleRequest("elicitation/create", func(ctx context.Context, _ string, params json.RawMessage) (interface{}, error) {
+		var request protocol.ElicitParams
+		if err := json.Unmarshal(params, &request); err != nil {
+			return nil, fmt.Errorf("decode elicitation request: %w", err)
+		}
+		return handler(ctx, request)
+	})
+}
+
+func (c *Client) HandleRoots(handler func(context.Context) (protocol.ListRootsResult, error)) {
+	if handler == nil {
+		c.HandleRequest("roots/list", nil)
+		return
+	}
+	c.HandleRequest("roots/list", func(ctx context.Context, _ string, _ json.RawMessage) (interface{}, error) {
+		return handler(ctx)
+	})
+}
+
+func (c *Client) HandleSampling(handler func(context.Context, protocol.CreateMessageParams) (protocol.CreateMessageResult, error)) {
+	if handler == nil {
+		c.HandleRequest("sampling/createMessage", nil)
+		return
+	}
+	c.HandleRequest("sampling/createMessage", func(ctx context.Context, _ string, params json.RawMessage) (interface{}, error) {
+		var request protocol.CreateMessageParams
+		if err := json.Unmarshal(params, &request); err != nil {
+			return nil, fmt.Errorf("decode sampling request: %w", err)
+		}
+		return handler(ctx, request)
+	})
+}
+
 func (c *Client) UnregisterTool(name string) error {
-	return c.Call("tools/unregister", map[string]interface{}{"name": name}, nil)
+	return c.Call("x-gomcp/tools/unregister", map[string]interface{}{"name": name}, nil)
+}
+
+func (c *Client) RegisterToolDefinition(definition protocol.ToolDefinition) error {
+	return c.Call("x-gomcp/tools/register", definition, nil)
+}
+
+func (c *Client) RegisterPromptDefinition(definition protocol.PromptDefinition) error {
+	return c.Call("x-gomcp/prompts/register", definition, nil)
 }
 
 func (c *Client) UnregisterPrompt(name string) error {
-	return c.Call("prompts/unregister", map[string]interface{}{"name": name}, nil)
+	return c.Call("x-gomcp/prompts/unregister", map[string]interface{}{"name": name}, nil)
 }
 
 func (c *Client) UnregisterResource(uri string) error {
-	return c.Call("resources/unregister", map[string]interface{}{"uri": uri}, nil)
+	return c.Call("x-gomcp/resources/unregister", map[string]interface{}{"uri": uri}, nil)
 }
 
 func (c *Client) ToolStream(name string, args map[string]interface{}) (<-chan protocol.Response, error) {
@@ -621,7 +842,11 @@ func (c *Client) ListenForNotifications(ctx context.Context) (<-chan protocol.Re
 	request.Header.Set("Accept", "text/event-stream")
 	c.stateMu.RLock()
 	client := c.httpClient
+	lastEventID := c.lastEventID
 	c.stateMu.RUnlock()
+	if lastEventID != "" {
+		request.Header.Set("Last-Event-ID", lastEventID)
+	}
 	response, err := client.Do(request)
 	if err != nil {
 		return nil, err
@@ -638,8 +863,13 @@ func (c *Client) ListenForNotifications(ctx context.Context) (<-chan protocol.Re
 		defer close(notifications)
 		scanner := bufio.NewScanner(response.Body)
 		scanner.Buffer(make([]byte, 64*1024), 1<<20)
+		eventID := ""
 		for scanner.Scan() {
 			line := scanner.Text()
+			if strings.HasPrefix(line, "id:") {
+				eventID = strings.TrimSpace(strings.TrimPrefix(line, "id:"))
+				continue
+			}
 			if !strings.HasPrefix(line, "data:") {
 				continue
 			}
@@ -650,6 +880,11 @@ func (c *Client) ListenForNotifications(ctx context.Context) (<-chan protocol.Re
 			var notification protocol.Request
 			if err := json.Unmarshal([]byte(data), &notification); err != nil || notification.ID != nil || notification.Method == "" {
 				continue
+			}
+			if eventID != "" {
+				c.stateMu.Lock()
+				c.lastEventID = eventID
+				c.stateMu.Unlock()
 			}
 			c.dispatchNotification(notification.Method, notification.Params)
 			select {
@@ -702,6 +937,7 @@ func (c *Client) newHTTPRequest(ctx context.Context, method string, body io.Read
 	sessionID := c.sessionID
 	protocolVersion := c.protocolVersion
 	apiKey := c.apiKey
+	tokenSource := c.tokenSource
 	c.stateMu.RUnlock()
 	if baseURL == "" {
 		return nil, fmt.Errorf("HTTP transport is not connected")
@@ -716,6 +952,16 @@ func (c *Client) newHTTPRequest(ctx context.Context, method string, body io.Read
 	}
 	if apiKey != "" {
 		request.Header.Set("X-API-Key", apiKey)
+	}
+	if tokenSource != nil {
+		token, err := tokenSource.Token(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("get bearer token: %w", err)
+		}
+		if strings.TrimSpace(token) == "" {
+			return nil, auth.ErrMissingToken
+		}
+		request.Header.Set("Authorization", "Bearer "+token)
 	}
 	return request, nil
 }
@@ -735,6 +981,89 @@ func (c *Client) dispatchNotification(method string, params json.RawMessage) {
 	if handler != nil {
 		handler(method, params)
 	}
+}
+
+func (c *Client) readStdio(decoder *json.Decoder, done chan struct{}) {
+	var readerErr error
+	defer func() {
+		c.readerErrMu.Lock()
+		c.readerErr = readerErr
+		c.readerErrMu.Unlock()
+		close(done)
+	}()
+
+	for {
+		var raw json.RawMessage
+		if err := decoder.Decode(&raw); err != nil {
+			readerErr = err
+			return
+		}
+		var request protocol.Request
+		if err := json.Unmarshal(raw, &request); err == nil && request.Method != "" {
+			if request.ID == nil {
+				c.dispatchNotification(request.Method, request.Params)
+			} else {
+				go c.handleServerRequest(request)
+			}
+			continue
+		}
+		var response protocol.Response
+		if err := json.Unmarshal(raw, &response); err != nil || response.ID == nil {
+			continue
+		}
+		requestID := string(*response.ID)
+		c.pendingMu.Lock()
+		responseChannel := c.pending[requestID]
+		delete(c.pending, requestID)
+		c.pendingMu.Unlock()
+		if responseChannel != nil {
+			responseChannel <- stdioResult{response: response}
+		}
+	}
+}
+
+func (c *Client) handleServerRequest(request protocol.Request) {
+	c.requestMu.RLock()
+	handler := c.requestHandlers[request.Method]
+	if handler == nil {
+		handler = c.requestHandler
+	}
+	c.requestMu.RUnlock()
+	response := protocol.Response{JSONRPC: "2.0", ID: request.ID}
+	if handler == nil {
+		response.Error = &protocol.ResponseError{Code: -32601, Message: "Method not found"}
+	} else {
+		result, err := handler(context.Background(), request.Method, request.Params)
+		if err != nil {
+			response.Error = &protocol.ResponseError{Code: -32603, Message: err.Error()}
+		} else {
+			response.Result = result
+		}
+	}
+	_ = c.writeStdio(response)
+}
+
+func (c *Client) writeStdio(message interface{}) error {
+	c.stateMu.RLock()
+	encoder := c.stdioEncoder
+	c.stateMu.RUnlock()
+	if encoder == nil {
+		return fmt.Errorf("stdio transport is not running")
+	}
+	c.stdioWriteMu.Lock()
+	defer c.stdioWriteMu.Unlock()
+	return encoder.Encode(message)
+}
+
+func (c *Client) removePending(requestID string) {
+	c.pendingMu.Lock()
+	delete(c.pending, requestID)
+	c.pendingMu.Unlock()
+}
+
+func mustMarshal(value interface{}) json.RawMessage {
+	encoded, _ := json.Marshal(value)
+	return encoded
 }
 
 func rawMessagePointer(value json.RawMessage) *json.RawMessage {
