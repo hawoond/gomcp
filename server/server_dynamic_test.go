@@ -6,63 +6,70 @@ import (
 	"testing"
 
 	"github.com/hawoond/gomcp/client"
+	"github.com/hawoond/gomcp/internal/types"
+	"github.com/hawoond/gomcp/protocol"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-func TestDynamicUnregister(t *testing.T) {
-	s := NewServer("test-dynamic-server", "1.0", false, "")
+func TestRemoteMutationDisabledByDefault(t *testing.T) {
+	server := NewServer("test-server", "1.0", false, "")
+	require.NoError(t, server.AddTool("tool1", "desc1", func() string { return "one" }, nil))
+	require.NoError(t, server.AddPrompt("prompt1", "desc1", func() string { return "one" }, nil))
+	require.NoError(t, server.AddResource("res://a", "desc", func() string { return "one" }))
 
-	// Register some tools, prompts, and resources
-	_ = s.AddTool("tool1", "desc1", func() {}, nil)
-	_ = s.AddTool("tool2", "desc2", func() {}, nil)
-	_ = s.AddPrompt("prompt1", "desc1", func() {}, nil)
-	_ = s.AddPrompt("prompt2", "desc2", func() {}, nil)
-	_ = s.AddResource("res://a", "desc_a", func() {})
-	_ = s.AddResource("res://b", "desc_b", func() {})
-
-	httpServer := httptest.NewServer(http.HandlerFunc(s.handleMcpRequest()))
+	httpServer := httptest.NewServer(http.HandlerFunc(server.handleMcpRequest()))
 	defer httpServer.Close()
 
-	c := client.NewClient()
-	c.ConnectHTTP(httpServer.URL)
+	mcpClient := client.NewClient()
+	mcpClient.ConnectHTTP(httpServer.URL)
 
-	// 1. Unregister tool1
-	err := c.UnregisterTool("tool1")
-	assert.NoError(t, err)
+	assert.Error(t, mcpClient.UnregisterTool("tool1"))
+	assert.Error(t, mcpClient.UnregisterPrompt("prompt1"))
+	assert.Error(t, mcpClient.UnregisterResource("res://a"))
 
-	// Verify tool1 is gone
-	tools, err := c.ListTools()
-	assert.NoError(t, err)
-	assert.Equal(t, 1, len(tools))
-	assert.Equal(t, "tool2", tools[0]["name"])
+	tools, err := mcpClient.ListTools()
+	require.NoError(t, err)
+	require.Len(t, tools, 1)
+	assert.Equal(t, "tool1", tools[0]["name"])
 
-	// Try to call tool1, should fail
-	err = c.Call("tools/call", map[string]interface{}{"name": "tool1"}, nil)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "Tool not found")
+	prompts, err := mcpClient.ListPrompts()
+	require.NoError(t, err)
+	require.Len(t, prompts, 1)
+	assert.Equal(t, "prompt1", prompts[0]["name"])
 
-	// 2. Unregister prompt1
-	err = c.UnregisterPrompt("prompt1")
-	assert.NoError(t, err)
+	resources, err := mcpClient.ListResources()
+	require.NoError(t, err)
+	require.Len(t, resources, 1)
+	assert.Equal(t, "res://a", resources[0]["uri"])
+}
 
-	// Verify prompt1 is gone
-	prompts, err := c.ListPrompts()
-	assert.NoError(t, err)
-	assert.Equal(t, 1, len(prompts))
-	assert.Equal(t, "prompt2", prompts[0]["name"])
+func TestExperimentalDynamicToolUsesSeparateRegistry(t *testing.T) {
+	server := NewServer("test-server", "1.0", false, "")
+	server.EnableExperimentalMethods(true)
+	require.NoError(t, server.AddDynamicTool(types.ToolDefinition{
+		Name:        "dynamic",
+		Description: "dynamic command",
+		Type:        "command",
+		Command:     &types.CommandConfig{Path: "echo"},
+	}))
 
-	// 3. Unregister res://a
-	err = c.UnregisterResource("res://a")
-	assert.NoError(t, err)
+	httpServer := httptest.NewServer(http.HandlerFunc(server.handleMcpRequest()))
+	defer httpServer.Close()
 
-	// Verify res://a is gone
-	resources, err := c.ListResources()
-	assert.NoError(t, err)
-	assert.Equal(t, 1, len(resources))
-	assert.Equal(t, "res://b", resources[0]["uri"])
+	mcpClient := client.NewClient()
+	mcpClient.ConnectHTTP(httpServer.URL)
 
-	// Try to read res://a, should fail
-	err = c.Call("resources/read", map[string]interface{}{"uri": "res://a"}, nil)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "Resource not found")
+	var result protocol.CallToolResult
+	require.NoError(t, mcpClient.Call("tools/call", map[string]interface{}{
+		"name":      "dynamic",
+		"arguments": map[string]interface{}{},
+	}, &result))
+	assert.True(t, result.IsError)
+	assert.Contains(t, result.Content[0].Text, "allowlisted")
+
+	require.NoError(t, mcpClient.UnregisterTool("dynamic"))
+	tools, err := mcpClient.ListTools()
+	require.NoError(t, err)
+	assert.Empty(t, tools)
 }

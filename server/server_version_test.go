@@ -1,44 +1,33 @@
 package server
 
 import (
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/hawoond/gomcp/client"
-	"github.com/hawoond/gomcp/internal/types"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-func TestVersionNegotiation_Success(t *testing.T) {
-	// Server supports v1 and v2
-	s := NewServer("test-version-server", "1.0", false, "", "v1", "v2")
-	httpServer := httptest.NewServer(http.HandlerFunc(s.handleMcpRequest()))
+func TestVersionNegotiationUsesRequestedSupportedVersion(t *testing.T) {
+	server := NewServer("version-server", "1.0", false, "", "v2", "v1")
+	httpServer := httptest.NewServer(http.HandlerFunc(server.handleMcpRequest()))
 	defer httpServer.Close()
 
-	c := client.NewClient()
-	c.ConnectHTTP(httpServer.URL)
-
-	// Client requests v2, which is supported
-	err := c.Initialize("test-client", "1.0", "v2")
-	assert.NoError(t, err)
+	mcpClient := client.NewClient()
+	mcpClient.ConnectHTTP(httpServer.URL)
+	require.NoError(t, mcpClient.Initialize("test-client", "1.0", "v1"))
+	assert.Equal(t, "v1", mcpClient.ProtocolVersion())
 }
 
-func TestVersionNegotiation_Failure(t *testing.T) {
-	// Server only supports v1
-	s := NewServer("test-version-server", "1.0", false, "", "v1")
-	httpServer := httptest.NewServer(http.HandlerFunc(s.handleMcpRequest()))
+func TestVersionNegotiationFallsBackToServerPreference(t *testing.T) {
+	server := NewServer("version-server", "1.0", false, "", "v2", "v1")
+	httpServer := httptest.NewServer(http.HandlerFunc(server.handleMcpRequest()))
 	defer httpServer.Close()
 
-	c := client.NewClient()
-	c.ConnectHTTP(httpServer.URL)
-
-	// Client requests v3, which is not supported
-	err := c.Initialize("test-client", "1.0", "v3")
-	assert.Error(t, err)
-
-	// Check if the error is the specific version mismatch error
-	assert.Contains(t, err.Error(), "Unsupported protocol version")
-	assert.Contains(t, err.Error(), fmt.Sprintf("%d", types.CodeVersionMismatch))
+	mcpClient := client.NewClient()
+	mcpClient.ConnectHTTP(httpServer.URL)
+	require.NoError(t, mcpClient.Initialize("test-client", "1.0", "v3"))
+	assert.Equal(t, "v2", mcpClient.ProtocolVersion())
 }
