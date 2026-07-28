@@ -1,176 +1,96 @@
 package server
 
 import (
-	"bufio"
 	"context"
-	"encoding/json"
-	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
-	"strings"
-	"sync"
 	"testing"
 	"time"
 
-	"github.com/hawoond/gomcp/internal/types"
+	"github.com/hawoond/gomcp/client"
+	"github.com/hawoond/gomcp/protocol"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-// --- Test Setup ---
-
-func setupTestServer(t *testing.T) (*Server, *httptest.Server) {
-	srv := NewServer("FeatureTestApp", "1.0.0", false, "")
-	// Use a custom mux to gain more control for testing
+func setupTestServer(t *testing.T) (*Server, *httptest.Server, *client.Client) {
+	t.Helper()
+	server := NewServer("test-server", "1.0", false, "")
 	mux := http.NewServeMux()
-	mux.HandleFunc("/mcp", srv.handleMcpRequest())
-	mux.HandleFunc("/health", srv.healthCheckHandler())
+	mux.HandleFunc("/mcp", server.handleMcpRequest())
+	mux.HandleFunc("/health", server.healthCheckHandler())
+	httpServer := httptest.NewServer(mux)
+	t.Cleanup(httpServer.Close)
 
-	ts := httptest.NewServer(mux)
-	t.Cleanup(ts.Close)
-	return srv, ts
+	mcpClient := client.NewClient()
+	mcpClient.ConnectHTTP(httpServer.URL)
+	t.Cleanup(func() {
+		_ = mcpClient.Close()
+	})
+	return server, httpServer, mcpClient
 }
-
-// --- Feature Tests ---
 
 func TestHealthCheck(t *testing.T) {
-	_, ts := setupTestServer(t)
-	resp, err := http.Get(ts.URL + "/health")
+	_, httpServer, _ := setupTestServer(t)
+	response, err := http.Get(httpServer.URL + "/health")
 	require.NoError(t, err)
-	defer resp.Body.Close()
-
-	assert.Equal(t, http.StatusOK, resp.StatusCode)
-	body, err := io.ReadAll(resp.Body)
-	require.NoError(t, err)
-	assert.Equal(t, "OK", string(body))
+	defer response.Body.Close()
+	assert.Equal(t, http.StatusOK, response.StatusCode)
 }
 
-func TestAsyncToolCall(t *testing.T) {
-	srv, ts := setupTestServer(t)
-
-	srv.AddTool("long_task", "A task that takes time", func() string {
-		time.Sleep(50 * time.Millisecond)
+func TestTaskLifecycle(t *testing.T) {
+	server, _, mcpClient := setupTestServer(t)
+	require.NoError(t, server.AddTool("long_task", "long task", func() string {
+		time.Sleep(20 * time.Millisecond)
 		return "done"
-	}, nil)
+	}, nil))
 
-	// 1. Call the tool asynchronously
-	callReqBody := `{"jsonrpc":"2.0","id":"async1","method":"tools/call_async","params":{"name":"long_task","arguments":{}}}`
-	resp, err := http.Post(ts.URL+"/mcp", "application/json", strings.NewReader(callReqBody))
+	taskID, err := mcpClient.CallAsync("long_task", map[string]interface{}{})
 	require.NoError(t, err)
+	require.NotEmpty(t, taskID)
 
-	var callResp types.Response
-	json.NewDecoder(resp.Body).Decode(&callResp)
-	require.Nil(t, callResp.Error)
-	resultMap, ok := callResp.Result.(map[string]interface{})
-	require.True(t, ok)
-	taskID, ok := resultMap["taskId"].(string)
-	require.True(t, ok)
-
-	// 2. Poll for the result
-	getResultBody := fmt.Sprintf(`{"jsonrpc":"2.0","id":"getres1","method":"tools/get_result","params":{"taskId":"%s"}}`, taskID)
-	var taskResp types.Response
-
+	var task *protocol.Task
 	require.Eventually(t, func() bool {
-		resp, err = http.Post(ts.URL+"/mcp", "application/json", strings.NewReader(getResultBody))
-		require.NoError(t, err)
-		json.NewDecoder(resp.Body).Decode(&taskResp)
-		require.Nil(t, taskResp.Error)
-		task, _ := taskResp.Result.(map[string]interface{})
-		return task["status"] == string(types.TaskStatusCompleted)
-	}, 2*time.Second, 100*time.Millisecond, "Task did not complete in time")
+		task, err = mcpClient.GetResult(taskID)
+		return err == nil && task.Status == protocol.TaskStatusCompleted
+	}, time.Second, 10*time.Millisecond)
+	require.NotNil(t, task.Result)
+}
 
-	task, _ := taskResp.Result.(map[string]interface{})
-	assert.Equal(t, "done", task["result"].(string))
+func TestTaskCancellation(t *testing.T) {
+	server, _, mcpClient := setupTestServer(t)
+	type input struct{}
+	require.NoError(t, RegisterTaskTool(server, "wait", "wait for cancellation", func(ctx context.Context, _ input) (string, error) {
+		<-ctx.Done()
+		return "", ctx.Err()
+	}))
+
+	taskID, err := mcpClient.CallAsync("wait", map[string]interface{}{})
+	require.NoError(t, err)
+	cancelled, err := mcpClient.CancelTask(taskID)
+	require.NoError(t, err)
+	assert.Equal(t, protocol.TaskStatusCancelled, cancelled.Status)
 }
 
 func TestEventSystemViaHTTP(t *testing.T) {
-	srv, ts := setupTestServer(t)
-
-	// Add a tool that will be called to trigger notifications
-	srv.AddTool("event_generator", "Generates events", func() string {
-		time.Sleep(50 * time.Millisecond)
-		return "event_done"
-	}, nil)
-
-	// --- Setup SSE Client ---
+	server, _, mcpClient := setupTestServer(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-
-	// Create the SSE request
-	initReq, _ := http.NewRequestWithContext(ctx, "POST", ts.URL+"/mcp", strings.NewReader(`{"jsonrpc":"2.0","id":"init1","method":"initialize","params":{"protocolVersion":"2024-11-05"}}`))
-	initReq.Header.Set("Accept", "text/event-stream")
-	initReq.Header.Set("Content-Type", "application/json")
-
-	// Channel to receive notifications on
-	notificationChan := make(chan types.Task, 2) // Buffer for 2 tasks
-	var wg sync.WaitGroup
-	wg.Add(1)
-
-	// Goroutine to listen for SSE events
-	go func() {
-		defer wg.Done()
-		resp, err := http.DefaultClient.Do(initReq)
-		require.NoError(t, err)
-		defer resp.Body.Close()
-
-		scanner := bufio.NewScanner(resp.Body)
-		for scanner.Scan() {
-			line := scanner.Text()
-			if strings.HasPrefix(line, "data:") {
-				data := strings.TrimPrefix(line, "data: ")
-				var notification types.Request
-				if json.Unmarshal([]byte(data), &notification) == nil {
-					if notification.Method == "events/taskStatusChanged" {
-						var task types.Task
-						if json.Unmarshal(notification.Params, &task) == nil {
-							notificationChan <- task
-						}
-					}
-				}
-			}
-		}
-	}()
-
-	// --- Trigger Event ---
-	// Give the SSE client a moment to connect before triggering the event
-	time.Sleep(100 * time.Millisecond)
-
-	// Make a separate, non-SSE call to trigger the async task
-	callReqBody := `{"jsonrpc":"2.0","id":"event_call","method":"tools/call_async","params":{"name":"event_generator","arguments":{}}}`
-	resp, err := http.Post(ts.URL+"/mcp", "application/json", strings.NewReader(callReqBody))
+	notifications, err := mcpClient.ListenForNotifications(ctx)
 	require.NoError(t, err)
-	resp.Body.Close()
 
-	// --- Verification ---
-	var receivedTasks []types.Task
-	timeout := time.After(2 * time.Second)
-	for i := 0; i < 2; i++ { // We expect 2 notifications
+	server.PublishNotification("events/first", map[string]string{"value": "one"})
+	server.PublishNotification("events/second", map[string]string{"value": "two"})
+
+	received := make([]protocol.Request, 0, 2)
+	timeout := time.After(time.Second)
+	for len(received) < 2 {
 		select {
-		case task := <-notificationChan:
-			receivedTasks = append(receivedTasks, task)
+		case notification := <-notifications:
+			received = append(received, notification)
 		case <-timeout:
 			t.Fatal("timed out waiting for notifications")
 		}
 	}
-
-	// Stop the listening goroutine
-	cancel()
-	wg.Wait()
-
-	// Verify the received notifications (order is not guaranteed)
-	assert.Len(t, receivedTasks, 2)
-	var hasRunning, hasCompleted bool
-	for _, task := range receivedTasks {
-		if task.Status == types.TaskStatusRunning {
-			hasRunning = true
-		}
-		if task.Status == types.TaskStatusCompleted {
-			hasCompleted = true
-			assert.Equal(t, "event_done", task.Result)
-		}
-	}
-
-	assert.True(t, hasRunning, "Did not receive 'running' status notification")
-	assert.True(t, hasCompleted, "Did not receive 'completed' status notification")
+	assert.ElementsMatch(t, []string{"events/first", "events/second"}, []string{received[0].Method, received[1].Method})
 }

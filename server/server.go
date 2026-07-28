@@ -3,18 +3,20 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
-	"os"
+	"net/url"
 	"os/exec"
-	"os/signal"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
-	"syscall"
+	"time"
 
 	"github.com/go-playground/validator/v10"
 	"github.com/google/uuid"
@@ -37,6 +39,9 @@ type Tool struct {
 	ParamTypes      []reflect.Type
 	ParamNames      []string
 	ParamStructType reflect.Type
+	InputSchema     map[string]interface{}
+	Handler         func(context.Context, map[string]interface{}) (interface{}, error)
+	TaskSupport     string
 }
 
 type Prompt struct {
@@ -60,9 +65,10 @@ type Server struct {
 	dynamicTools              map[string]types.ToolDefinition
 	dynamicPrompts            map[string]types.PromptDefinition
 	tasks                     map[string]*types.Task
+	taskResults               map[string]interface{}
+	taskCancels               map[string]context.CancelFunc
+	taskExpires               map[string]time.Time
 	tasksMu                   sync.RWMutex
-	mu                        sync.Mutex
-	shuttingDown              bool
 	validator                 *validator.Validate
 	rwMu                      sync.RWMutex
 	logger                    *zap.Logger
@@ -71,12 +77,29 @@ type Server struct {
 	eventSubscribers          map[chan []byte]bool
 	subscribersMu             sync.RWMutex
 	middlewares               []Middleware
+	httpClient                *http.Client
+	maxRequestBytes           int64
+	maxResponseBytes          int64
+	commandTimeout            time.Duration
+	taskTTL                   time.Duration
+	maxTasks                  int
+	allowedOrigins            map[string]struct{}
+	allowedCommandPaths       map[string]struct{}
+	allowedHTTPHosts          map[string]struct{}
+	enableExperimentalMethods bool
+	sessions                  map[string]string
+	sessionsMu                sync.RWMutex
 }
 
 func NewServer(name string, version string, enableAuth bool, apiKey string, supportedVersions ...string) *Server {
 	logger, _ := zap.NewDevelopment()
 	if len(supportedVersions) == 0 {
-		supportedVersions = []string{"2024-11-05"} // Default version
+		supportedVersions = []string{
+			types.ProtocolVersion20251125,
+			types.ProtocolVersion20250618,
+			types.ProtocolVersion20250326,
+			types.ProtocolVersion20241105,
+		}
 	}
 	return &Server{
 		Name:                      name,
@@ -88,18 +111,36 @@ func NewServer(name string, version string, enableAuth bool, apiKey string, supp
 		dynamicTools:              make(map[string]types.ToolDefinition),
 		dynamicPrompts:            make(map[string]types.PromptDefinition),
 		tasks:                     make(map[string]*types.Task),
+		taskResults:               make(map[string]interface{}),
+		taskCancels:               make(map[string]context.CancelFunc),
+		taskExpires:               make(map[string]time.Time),
 		validator:                 validator.New(),
 		logger:                    logger,
 		EnableAuth:                enableAuth,
 		APIKey:                    apiKey,
 		eventSubscribers:          make(map[chan []byte]bool),
 		middlewares:               []Middleware{},
+		httpClient:                &http.Client{Timeout: 30 * time.Second},
+		maxRequestBytes:           1 << 20,
+		maxResponseBytes:          4 << 20,
+		commandTimeout:            30 * time.Second,
+		taskTTL:                   15 * time.Minute,
+		maxTasks:                  1000,
+		allowedOrigins:            make(map[string]struct{}),
+		allowedCommandPaths:       make(map[string]struct{}),
+		allowedHTTPHosts:          make(map[string]struct{}),
+		sessions:                  make(map[string]string),
 	}
 }
 
 func (s *Server) AddResource(uriTemplate string, description string, handler interface{}) error {
 	s.rwMu.Lock()
 	defer s.rwMu.Unlock()
+	for _, resource := range s.resources {
+		if resource.URITemplate == uriTemplate {
+			return fmt.Errorf("resource %q is already registered", uriTemplate)
+		}
+	}
 	fnVal := reflect.ValueOf(handler)
 	fnType := fnVal.Type()
 	if fnType.Kind() != reflect.Func {
@@ -134,6 +175,9 @@ func (s *Server) AddTool(name string, description string, handler interface{}, p
 	if outCount > 2 {
 		return fmt.Errorf("tool %s: too many return values", name)
 	}
+	if outCount == 2 && !fnType.Out(1).Implements(reflect.TypeOf((*error)(nil)).Elem()) {
+		return fmt.Errorf("tool %s: second return value must implement error", name)
+	}
 	var paramStructType reflect.Type
 	if paramStruct != nil {
 		paramStructType = reflect.TypeOf(paramStruct)
@@ -154,6 +198,23 @@ func (s *Server) AddTool(name string, description string, handler interface{}, p
 	if len(finalParamNames) != paramCount {
 		return fmt.Errorf("tool %s: number of provided paramNames (%d) != function parameters (%d)", name, len(finalParamNames), paramCount)
 	}
+	if _, exists := s.tools[name]; exists {
+		return fmt.Errorf("tool %q is already registered", name)
+	}
+
+	properties := make(map[string]interface{}, len(finalParamNames))
+	for index, paramName := range finalParamNames {
+		properties[paramName] = schemaForType(fnType.In(index), make(map[reflect.Type]bool))
+	}
+	inputSchema := map[string]interface{}{
+		"type":                 "object",
+		"properties":           properties,
+		"required":             append([]string(nil), finalParamNames...),
+		"additionalProperties": false,
+	}
+	if paramStructType != nil {
+		inputSchema = schemaForType(paramStructType, make(map[reflect.Type]bool))
+	}
 	s.tools[name] = Tool{
 		Name:            name,
 		Description:     description,
@@ -161,6 +222,8 @@ func (s *Server) AddTool(name string, description string, handler interface{}, p
 		ParamTypes:      util.FuncParamTypes(fnType),
 		ParamNames:      finalParamNames,
 		ParamStructType: paramStructType,
+		InputSchema:     inputSchema,
+		TaskSupport:     "optional",
 	}
 	s.logger.Info("Tool registered", zap.String("name", name))
 	return nil
@@ -175,6 +238,13 @@ func (s *Server) AddPrompt(name string, description string, handler interface{},
 		return fmt.Errorf("handler for prompt %s is not a function", name)
 	}
 	paramCount := fnType.NumIn()
+	outCount := fnType.NumOut()
+	if outCount == 0 || outCount > 2 {
+		return fmt.Errorf("prompt %s: handler must return a value and optional error", name)
+	}
+	if outCount == 2 && !fnType.Out(1).Implements(reflect.TypeOf((*error)(nil)).Elem()) {
+		return fmt.Errorf("prompt %s: second return value must implement error", name)
+	}
 	var paramStructType reflect.Type
 	if paramStruct != nil {
 		paramStructType = reflect.TypeOf(paramStruct)
@@ -195,6 +265,9 @@ func (s *Server) AddPrompt(name string, description string, handler interface{},
 	if len(finalParamNames) != paramCount {
 		return fmt.Errorf("prompt %s: number of provided paramNames (%d) != function parameters (%d)", name, len(finalParamNames), paramCount)
 	}
+	if _, exists := s.prompts[name]; exists {
+		return fmt.Errorf("prompt %q is already registered", name)
+	}
 	s.prompts[name] = Prompt{
 		Name:            name,
 		Description:     description,
@@ -208,69 +281,137 @@ func (s *Server) AddPrompt(name string, description string, handler interface{},
 }
 
 func (s *Server) RunStdio(reader io.Reader, writer io.Writer) error {
+	return s.RunStdioContext(context.Background(), reader, writer)
+}
+
+func (s *Server) RunStdioContext(ctx context.Context, reader io.Reader, writer io.Writer) error {
 	s.logger.Info("Starting MCP server via STDIO", zap.String("name", s.Name), zap.String("version", s.Version))
-
-	ctx, cancel := context.WithCancel(context.Background())
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-
-	go func() {
-		<-sigCh
-		s.logger.Info("Shutdown signal received - shutting down server...")
-		s.shuttingDown = true
-		cancel() // Signal context cancellation
-	}()
 
 	decoder := json.NewDecoder(reader)
 	encoder := json.NewEncoder(writer)
+	initialized := false
+	stopClose := make(chan struct{})
+	if closer, ok := reader.(io.Closer); ok {
+		go func() {
+			select {
+			case <-ctx.Done():
+				_ = closer.Close()
+			case <-stopClose:
+			}
+		}()
+	}
+	defer close(stopClose)
 
 	for {
-		select {
-		case <-ctx.Done():
-			s.logger.Info("Server context cancelled, exiting STDIO loop.")
-			return nil
-		default:
-			var raw json.RawMessage
-			if err := decoder.Decode(&raw); err != nil {
-				if errors.Is(err, io.EOF) || errors.Is(err, os.ErrClosed) || s.shuttingDown {
-					s.logger.Info("STDIO input closed or server shutting down.")
-					return nil
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		var raw json.RawMessage
+		if err := decoder.Decode(&raw); err != nil {
+			if errors.Is(err, io.EOF) {
+				if ctx.Err() != nil {
+					return ctx.Err()
 				}
-				respErr := s.makeErrorResponse(nil, types.CodeParseError, "Parse error", nil)
-				_ = encoder.Encode(respErr)
-				continue
+				return nil
 			}
-			responses := s.handleMessage(raw)
-			for _, resp := range responses {
-				_ = encoder.Encode(resp)
+			respErr := s.makeErrorResponse(nil, types.CodeParseError, "Parse error", nil)
+			if encodeErr := encoder.Encode(respErr); encodeErr != nil {
+				return encodeErr
+			}
+			continue
+		}
+		var request types.Request
+		if err := json.Unmarshal(raw, &request); err != nil || request.JSONRPC != "2.0" || request.Method == "" {
+			if err := encoder.Encode(s.makeErrorResponse(nil, types.CodeInvalidRequest, "Invalid Request", nil)); err != nil {
+				return err
+			}
+			continue
+		}
+		if !initialized && request.Method != "initialize" {
+			if err := encoder.Encode(s.makeErrorResponse(request.ID, types.CodeInvalidRequest, "initialize must be the first request", nil)); err != nil {
+				return err
+			}
+			continue
+		}
+		if initialized && request.Method == "initialize" {
+			if err := encoder.Encode(s.makeErrorResponse(request.ID, types.CodeInvalidRequest, "server is already initialized", nil)); err != nil {
+				return err
+			}
+			continue
+		}
+		responses := s.handleMessage(ctx, raw)
+		if request.Method == "initialize" && len(responses) == 1 && responses[0].Error == nil {
+			initialized = true
+		}
+		for _, resp := range responses {
+			if err := encoder.Encode(resp); err != nil {
+				return err
 			}
 		}
 	}
 }
 
 func (s *Server) AddMiddleware(mw Middleware) {
+	s.rwMu.Lock()
+	defer s.rwMu.Unlock()
 	s.middlewares = append(s.middlewares, mw)
 }
 
 func (s *Server) ListenAndServe(addr string) error {
+	return s.ListenAndServeContext(context.Background(), addr)
+}
+
+func (s *Server) ListenAndServeContext(ctx context.Context, addr string) error {
+	httpServer := &http.Server{
+		Addr:              addr,
+		Handler:           s.Handler(),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+
+	serveCtx, stopServe := context.WithCancel(ctx)
+	defer stopServe()
+	shutdownDone := make(chan struct{})
+	go func() {
+		defer close(shutdownDone)
+		<-serveCtx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = httpServer.Shutdown(shutdownCtx)
+	}()
+
+	s.logger.Info("Starting MCP server with Streamable HTTP", zap.String("addr", addr))
+	err := httpServer.ListenAndServe()
+	stopServe()
+	<-shutdownDone
+	if errors.Is(err, http.ErrServerClosed) {
+		return nil
+	}
+	return err
+}
+
+func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
 	httpHandler := s.authMiddleware(s.handleMcpRequest())
+	s.rwMu.RLock()
 	for i := len(s.middlewares) - 1; i >= 0; i-- {
 		httpHandler = s.middlewares[i](httpHandler)
 	}
+	s.rwMu.RUnlock()
 
 	mux.HandleFunc("/mcp", httpHandler)
 	mux.HandleFunc("/health", s.healthCheckHandler())
-	s.logger.Info("Starting MCP server with HTTP SSE", zap.String("addr", addr))
-	return http.ListenAndServe(addr, mux)
+	return mux
 }
 
 func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if s.EnableAuth {
 			apiKey := r.Header.Get("X-API-Key")
-			if apiKey == "" || apiKey != s.APIKey {
+			if apiKey == "" || len(apiKey) != len(s.APIKey) ||
+				subtle.ConstantTimeCompare([]byte(apiKey), []byte(s.APIKey)) != 1 {
 				http.Error(w, "Unauthorized", http.StatusUnauthorized)
 				return
 			}
@@ -281,35 +422,74 @@ func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 
 func (s *Server) handleMcpRequest() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
+		if !s.originAllowed(r) {
+			http.Error(w, "Forbidden origin", http.StatusForbidden)
+			return
+		}
+
+		switch r.Method {
+		case http.MethodDelete:
+			s.deleteSession(w, r)
+			return
+		case http.MethodGet:
+			s.serveNotificationStream(w, r)
+			return
+		case http.MethodPost:
+		default:
+			w.Header().Set("Allow", "POST, DELETE")
 			http.Error(w, "Invalid method", http.StatusMethodNotAllowed)
 			return
 		}
-		wantsSSE := strings.Contains(r.Header.Get("Accept"), "text/event-stream")
+
+		if contentType := r.Header.Get("Content-Type"); !strings.HasPrefix(strings.ToLower(contentType), "application/json") {
+			http.Error(w, "Content-Type must be application/json", http.StatusUnsupportedMediaType)
+			return
+		}
+		accept := strings.ToLower(r.Header.Get("Accept"))
+		if !strings.Contains(accept, "application/json") || !strings.Contains(accept, "text/event-stream") {
+			http.Error(w, "Accept must include application/json and text/event-stream", http.StatusNotAcceptable)
+			return
+		}
+
+		s.rwMu.RLock()
+		maxRequestBytes := s.maxRequestBytes
+		s.rwMu.RUnlock()
+		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes)
+
 		var raw json.RawMessage
 		dec := json.NewDecoder(r.Body)
 		if err := dec.Decode(&raw); err != nil {
-			respErr := s.makeErrorResponse(nil, types.CodeParseError, "Parse error", nil)
-			respBytes, _ := json.Marshal(respErr)
-			if wantsSSE {
-				w.Header().Set("Content-Type", "text/event-stream")
-				fmt.Fprintf(w, "data: %s\n\n", respBytes)
-			} else {
-				http.Error(w, string(respBytes), http.StatusBadRequest)
-			}
+			s.writeJSONRPCError(w, http.StatusBadRequest, nil, types.CodeParseError, "Parse error", nil)
+			return
+		}
+		var extra json.RawMessage
+		if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+			s.writeJSONRPCError(w, http.StatusBadRequest, nil, types.CodeInvalidRequest, "Only one JSON-RPC message is allowed", nil)
+			return
+		}
+		if len(raw) == 0 || raw[0] == '[' {
+			s.writeJSONRPCError(w, http.StatusBadRequest, nil, types.CodeInvalidRequest, "Batch messages are not supported over HTTP", nil)
 			return
 		}
 
 		var req types.Request
-		isStream := false
-		if wantsSSE {
-			if err := json.Unmarshal(raw, &req); err == nil {
-				if req.Method == "tools/call_stream" || req.Method == "prompts/get_stream" {
-					isStream = true
-				}
+		if err := json.Unmarshal(raw, &req); err != nil || req.JSONRPC != "2.0" || req.Method == "" {
+			s.writeJSONRPCError(w, http.StatusBadRequest, nil, types.CodeInvalidRequest, "Invalid Request", nil)
+			return
+		}
+
+		isInitialize := req.Method == "initialize"
+		if !isInitialize {
+			if status, message := s.validateSession(r); status != 0 {
+				http.Error(w, message, status)
+				return
 			}
 		}
 
+		s.rwMu.RLock()
+		experimental := s.enableExperimentalMethods
+		s.rwMu.RUnlock()
+		isStream := experimental && (req.Method == "tools/call_stream" || req.Method == "prompts/get_stream")
 		if isStream {
 			w.Header().Set("Content-Type", "text/event-stream")
 			flusher, ok := w.(http.Flusher)
@@ -317,54 +497,160 @@ func (s *Server) handleMcpRequest() http.HandlerFunc {
 				http.Error(w, "Streaming unsupported", http.StatusInternalServerError)
 				return
 			}
-			s.handleStreamRequest(&req, w, flusher)
+			s.handleStreamRequest(r.Context(), &req, w, flusher)
 			return
 		}
 
-		responses := s.handleMessage(raw)
-		if wantsSSE {
-			w.Header().Set("Content-Type", "text/event-stream")
-			flusher, ok := w.(http.Flusher)
-			if !ok {
-				http.Error(w, "Streaming unsupported", http.StatusInternalServerError)
-				return
-			}
-			for _, resp := range responses {
-				data, _ := json.Marshal(resp)
-				fmt.Fprintf(w, "data: %s\n\n", data)
-				flusher.Flush()
-            }
+		responses := s.handleMessage(r.Context(), raw)
+		if req.ID == nil {
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		if len(responses) != 1 {
+			s.writeJSONRPCError(w, http.StatusInternalServerError, req.ID, types.CodeInternalError, "Missing response", nil)
+			return
+		}
+		if isInitialize && responses[0].Error == nil {
+			protocolVersion := initializationProtocolVersion(responses[0].Result)
+			sessionID := uuid.NewString()
+			s.sessionsMu.Lock()
+			s.sessions[sessionID] = protocolVersion
+			s.sessionsMu.Unlock()
+			w.Header().Set("MCP-Session-Id", sessionID)
+		}
 
-            // Keep the connection open for notifications
-            notificationChan := make(chan []byte)
-            s.addSubscriber(notificationChan)
-            defer s.removeSubscriber(notificationChan)
-
-            ctx := r.Context()
-            for {
-                select {
-                case notification := <-notificationChan:
-                    fmt.Fprintf(w, "data: %s\n\n", notification)
-                    flusher.Flush()
-                case <-ctx.Done():
-                    return // Client disconnected
-                }
-            }
-        } else {
-            var out interface{}
-            if len(responses) == 1 {
-                out = responses[0]
-            } else {
-                out = responses
-			}
-			w.Header().Set("Content-Type", "application/json")
-			enc := json.NewEncoder(w)
-			_ = enc.Encode(out)
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(responses[0]); err != nil {
+			s.logger.Error("write JSON-RPC response", zap.Error(err))
 		}
 	}
 }
 
-func (s *Server) handleMessage(raw json.RawMessage) []types.Response {
+func (s *Server) serveNotificationStream(w http.ResponseWriter, r *http.Request) {
+	if !strings.Contains(strings.ToLower(r.Header.Get("Accept")), "text/event-stream") {
+		http.Error(w, "Accept must include text/event-stream", http.StatusNotAcceptable)
+		return
+	}
+	if status, message := s.validateSession(r); status != 0 {
+		http.Error(w, message, status)
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "Streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	_, _ = fmt.Fprint(w, "event: ready\ndata:\n\n")
+	flusher.Flush()
+
+	notifications := make(chan []byte, 64)
+	s.addSubscriber(notifications)
+	defer s.removeSubscriber(notifications)
+	heartbeat := time.NewTicker(20 * time.Second)
+	defer heartbeat.Stop()
+
+	for {
+		select {
+		case notification, open := <-notifications:
+			if !open {
+				return
+			}
+			if _, err := fmt.Fprintf(w, "data: %s\n\n", notification); err != nil {
+				return
+			}
+			flusher.Flush()
+		case <-heartbeat.C:
+			if _, err := fmt.Fprint(w, ": keep-alive\n\n"); err != nil {
+				return
+			}
+			flusher.Flush()
+		case <-r.Context().Done():
+			return
+		}
+	}
+}
+
+func (s *Server) originAllowed(r *http.Request) bool {
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		return true
+	}
+	parsed, err := url.Parse(origin)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return false
+	}
+	normalized := strings.ToLower(parsed.Scheme + "://" + parsed.Host)
+	s.rwMu.RLock()
+	_, explicitlyAllowed := s.allowedOrigins[normalized]
+	s.rwMu.RUnlock()
+	if explicitlyAllowed {
+		return true
+	}
+	requestScheme := "http"
+	if r.TLS != nil {
+		requestScheme = "https"
+	}
+	return normalized == strings.ToLower(requestScheme+"://"+r.Host)
+}
+
+func (s *Server) validateSession(r *http.Request) (int, string) {
+	sessionID := r.Header.Get("MCP-Session-Id")
+	if sessionID == "" {
+		return http.StatusBadRequest, "MCP-Session-Id is required"
+	}
+	s.sessionsMu.RLock()
+	protocolVersion, ok := s.sessions[sessionID]
+	s.sessionsMu.RUnlock()
+	if !ok {
+		return http.StatusNotFound, "MCP session not found"
+	}
+	if r.Header.Get("MCP-Protocol-Version") != protocolVersion {
+		return http.StatusBadRequest, "MCP-Protocol-Version does not match the session"
+	}
+	return 0, ""
+}
+
+func (s *Server) deleteSession(w http.ResponseWriter, r *http.Request) {
+	if status, message := s.validateSession(r); status != 0 {
+		http.Error(w, message, status)
+		return
+	}
+	sessionID := r.Header.Get("MCP-Session-Id")
+	s.sessionsMu.Lock()
+	delete(s.sessions, sessionID)
+	s.sessionsMu.Unlock()
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) writeJSONRPCError(
+	w http.ResponseWriter,
+	status int,
+	id *json.RawMessage,
+	code int,
+	message string,
+	data interface{},
+) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(s.makeErrorResponse(id, code, message, data))
+}
+
+func initializationProtocolVersion(result interface{}) string {
+	resultMap, ok := result.(map[string]interface{})
+	if !ok {
+		return types.LatestProtocolVersion
+	}
+	version, _ := resultMap["protocolVersion"].(string)
+	if version == "" {
+		return types.LatestProtocolVersion
+	}
+	return version
+}
+
+func (s *Server) handleMessage(ctx context.Context, raw json.RawMessage) []types.Response {
 	var responses []types.Response
 	firstChar := []byte(strings.TrimSpace(string(raw)))[0]
 	if firstChar == '[' {
@@ -378,7 +664,7 @@ func (s *Server) handleMessage(raw json.RawMessage) []types.Response {
 			return []types.Response{resp}
 		}
 		for _, req := range reqs {
-			resps := s.processRequest(&req)
+			resps := s.processRequest(ctx, &req)
 			responses = append(responses, resps...)
 		}
 	} else {
@@ -391,24 +677,24 @@ func (s *Server) handleMessage(raw json.RawMessage) []types.Response {
 			resp := s.makeErrorResponse(req.ID, types.CodeInvalidRequest, "Invalid Request", nil)
 			return []types.Response{resp}
 		}
-		responses = s.processRequest(&req)
+		responses = s.processRequest(ctx, &req)
 	}
 	return responses
 }
 
-func (s *Server) processRequest(req *types.Request) []types.Response {
+func (s *Server) processRequest(ctx context.Context, req *types.Request) []types.Response {
 	if req.ID == nil {
 		if req.Method == "notifications/initialized" {
 			s.logger.Info("Received client initialization complete signal")
 			return []types.Response{}
 		}
-		_, _ = s.routeMethod(req, nil)
+		_, _ = s.routeMethod(ctx, req, nil)
 		return []types.Response{}
 	}
 	var resp types.Response
 	resp.ID = req.ID
 	resp.JSONRPC = "2.0"
-	result, err := s.routeMethod(req, &resp.Error)
+	result, err := s.routeMethod(ctx, req, &resp.Error)
 	if err != nil {
 		resp.Result = nil
 	} else {
@@ -418,7 +704,7 @@ func (s *Server) processRequest(req *types.Request) []types.Response {
 	return []types.Response{resp}
 }
 
-func (s *Server) routeMethod(req *types.Request, respErrPtr **types.ResponseError) (interface{}, error) {
+func (s *Server) routeMethod(ctx context.Context, req *types.Request, respErrPtr **types.ResponseError) (interface{}, error) {
 	method := req.Method
 	s.logger.Info("Routing method", zap.String("method", method))
 	switch method {
@@ -429,34 +715,41 @@ func (s *Server) routeMethod(req *types.Request, respErrPtr **types.ResponseErro
 			ClientInfo      map[string]interface{} `json:"clientInfo"`
 			Capabilities    map[string]interface{} `json:"capabilities"`
 		}
-		_ = json.Unmarshal(req.Params, &params)
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			*respErrPtr = s.newError(types.CodeInvalidParams, "Invalid initialize parameters", nil)
+			return nil, err
+		}
 
-		// Version negotiation
-		clientVersion := params.ProtocolVersion
-		versionSupported := false
+		negotiatedVersion := ""
 		for _, v := range s.SupportedProtocolVersions {
-			if v == clientVersion {
-				versionSupported = true
+			if v == params.ProtocolVersion {
+				negotiatedVersion = v
 				break
 			}
 		}
-
-		if !versionSupported {
-			errData := map[string]interface{}{
-				"supportedVersions": s.SupportedProtocolVersions,
+		if negotiatedVersion == "" {
+			if len(s.SupportedProtocolVersions) == 0 {
+				*respErrPtr = s.newError(types.CodeInternalError, "Server has no supported protocol versions", nil)
+				return nil, errors.New("no supported protocol versions")
 			}
-			*respErrPtr = s.newError(types.CodeVersionMismatch, "Unsupported protocol version", errData)
-			return nil, errors.New("version mismatch")
+			negotiatedVersion = s.SupportedProtocolVersions[0]
 		}
 
 		s.logger.Info("Processing initialize request", zap.Any("client", params.ClientInfo), zap.String("protocolVersion", params.ProtocolVersion))
 		serverCaps := map[string]interface{}{
-			"tools":     map[string]interface{}{},
-			"resources": map[string]interface{}{},
-			"prompts":   map[string]interface{}{},
+			"tools":     map[string]interface{}{"listChanged": false},
+			"resources": map[string]interface{}{"subscribe": false, "listChanged": false},
+			"prompts":   map[string]interface{}{"listChanged": false},
+			"tasks": map[string]interface{}{
+				"list":   map[string]interface{}{},
+				"cancel": map[string]interface{}{},
+				"requests": map[string]interface{}{
+					"tools": map[string]interface{}{"call": map[string]interface{}{}},
+				},
+			},
 		}
 		result := map[string]interface{}{
-			"protocolVersion": params.ProtocolVersion,
+			"protocolVersion": negotiatedVersion,
 			"serverInfo": map[string]interface{}{
 				"name":    s.Name,
 				"version": s.Version,
@@ -468,48 +761,35 @@ func (s *Server) routeMethod(req *types.Request, respErrPtr **types.ResponseErro
 	case "tools/list":
 		s.rwMu.RLock()
 		defer s.rwMu.RUnlock()
-		toolsList := []map[string]interface{}{}
-		for name, tool := range s.tools {
-			propMap := map[string]interface{}{}
-			for i, pType := range tool.ParamTypes {
-				prop := map[string]interface{}{
-					"name": tool.ParamNames[i],
-				}
-				switch pType.Kind() {
-				case reflect.Int, reflect.Int64, reflect.Float32, reflect.Float64:
-					prop["type"] = "number"
-				case reflect.Bool:
-					prop["type"] = "boolean"
-				case reflect.String:
-					prop["type"] = "string"
-				default:
-					prop["type"] = "object" // Default to object for complex types
-				}
-				propMap[tool.ParamNames[i]] = prop
-			}
-			schema := map[string]interface{}{
-				"type":       "object",
-				"properties": propMap,
-			}
-			reqFields := []string{}
-			for _, name := range tool.ParamNames {
-				reqFields = append(reqFields, name)
-			}
-			schema["required"] = reqFields
-
-			toolsList = append(toolsList, map[string]interface{}{
+		toolNames := make([]string, 0, len(s.tools))
+		for name := range s.tools {
+			toolNames = append(toolNames, name)
+		}
+		sort.Strings(toolNames)
+		toolsList := make([]map[string]interface{}, 0, len(s.tools)+len(s.dynamicTools))
+		for _, name := range toolNames {
+			tool := s.tools[name]
+			entry := map[string]interface{}{
 				"name":        name,
 				"description": tool.Description,
-				"inputSchema": schema,
-			})
+				"inputSchema": tool.InputSchema,
+			}
+			if tool.TaskSupport != "" {
+				entry["execution"] = map[string]interface{}{"taskSupport": tool.TaskSupport}
+			}
+			toolsList = append(toolsList, entry)
 		}
 
-		// Add dynamically registered tools
-		for name, toolDef := range s.dynamicTools {
+		dynamicNames := make([]string, 0, len(s.dynamicTools))
+		for name := range s.dynamicTools {
+			dynamicNames = append(dynamicNames, name)
+		}
+		sort.Strings(dynamicNames)
+		for _, name := range dynamicNames {
+			toolDef := s.dynamicTools[name]
 			toolEntry := map[string]interface{}{
 				"name":        name,
 				"description": toolDef.Description,
-				"type":        toolDef.Type,
 			}
 			if toolDef.InputSchema != nil {
 				var schema map[string]interface{}
@@ -525,106 +805,88 @@ func (s *Server) routeMethod(req *types.Request, respErrPtr **types.ResponseErro
 		return result, nil
 
 	case "tools/call":
-		s.rwMu.RLock()
-		defer s.rwMu.RUnlock()
 		var params struct {
 			Name      string                 `json:"name"`
 			Arguments map[string]interface{} `json:"arguments"`
+			Task      *struct {
+				TTL int64 `json:"ttl,omitempty"`
+			} `json:"task,omitempty"`
 		}
 		if err := json.Unmarshal(req.Params, &params); err != nil {
 			*respErrPtr = s.newError(types.CodeInvalidParams, "Invalid params", nil)
 			return nil, errors.New("param parse error")
 		}
 
-		// Check for dynamically registered tool first
+		s.rwMu.RLock()
 		if toolDef, ok := s.dynamicTools[params.Name]; ok {
-			return s.callDynamicTool(toolDef, params.Arguments, respErrPtr)
+			s.rwMu.RUnlock()
+			if params.Task != nil {
+				*respErrPtr = s.newError(types.CodeInvalidParams, "Dynamic tools do not support tasks", nil)
+				return nil, errors.New("task unsupported")
+			}
+			result, err := s.callDynamicTool(ctx, toolDef, params.Arguments, respErrPtr)
+			return toToolResult(result, err), nil
 		}
-
-		// Fallback to statically registered Go function tool
 		tool, ok := s.tools[params.Name]
+		s.rwMu.RUnlock()
 		if !ok {
 			*respErrPtr = s.newError(types.CodeMethodNotFound, "Tool not found", nil)
 			return nil, errors.New("tool not found")
 		}
-
-		if tool.ParamStructType != nil {
-			paramInstance := reflect.New(tool.ParamStructType).Interface()
-			jsonParams, _ := json.Marshal(params.Arguments)
-			if err := json.Unmarshal(jsonParams, paramInstance); err != nil {
-				*respErrPtr = s.newError(types.CodeInvalidParams, "Invalid params: "+err.Error(), nil)
+		if params.Task != nil {
+			if tool.TaskSupport == "forbidden" {
+				*respErrPtr = s.newError(types.CodeInvalidParams, "Tool does not support task execution", nil)
+				return nil, errors.New("task unsupported")
+			}
+			task, err := s.startToolTask(tool, params.Arguments, params.Task.TTL)
+			if err != nil {
+				*respErrPtr = s.newError(types.CodeServerError, err.Error(), nil)
 				return nil, err
 			}
-			if err := s.validator.Struct(paramInstance); err != nil {
-				*respErrPtr = s.newError(types.CodeInvalidParams, "Validation error: "+err.Error(), nil)
-				return nil, err
-			}
+			return task, nil
 		}
-		args, err := s.prepareFuncArgs(tool.ParamTypes, params.Arguments, tool.ParamNames)
-		if err != nil {
-			*respErrPtr = s.newError(types.CodeInvalidParams, "Invalid params: "+err.Error(), nil)
-			return nil, err
-		}
-		outVals := tool.Func.Call(args)
-		return s.handleFunctionOutputs(outVals, respErrPtr)
+		result, err := s.invokeTool(ctx, tool, params.Arguments)
+		return toToolResult(result, err), nil
 
 	case "tools/call_async":
 		s.rwMu.RLock()
-		defer s.rwMu.RUnlock()
+		experimental := s.enableExperimentalMethods
+		s.rwMu.RUnlock()
+		if !experimental {
+			*respErrPtr = s.newError(types.CodeMethodNotFound, "Method not found", nil)
+			return nil, errors.New("experimental methods disabled")
+		}
+		s.rwMu.RLock()
 		var params struct {
 			Name      string                 `json:"name"`
 			Arguments map[string]interface{} `json:"arguments"`
 		}
 		if err := json.Unmarshal(req.Params, &params); err != nil {
+			s.rwMu.RUnlock()
 			*respErrPtr = s.newError(types.CodeInvalidParams, "Invalid params", nil)
 			return nil, errors.New("param parse error")
 		}
 		tool, ok := s.tools[params.Name]
+		s.rwMu.RUnlock()
 		if !ok {
 			*respErrPtr = s.newError(types.CodeMethodNotFound, "Tool not found", nil)
 			return nil, errors.New("tool not found")
 		}
-
-		taskID := uuid.New().String()
-		task := &types.Task{ID: taskID, Status: types.TaskStatusRunning}
-		s.tasksMu.Lock()
-		s.tasks[taskID] = task
-		s.tasksMu.Unlock()
-
-		s.PublishNotification("events/taskStatusChanged", task)
-
-		go func() {
-			defer func() {
-				s.tasksMu.Lock()
-				defer s.tasksMu.Unlock()
-				s.PublishNotification("events/taskStatusChanged", task)
-			}()
-
-			args, err := s.prepareFuncArgs(tool.ParamTypes, params.Arguments, tool.ParamNames)
-			if err != nil {
-				task.Status = types.TaskStatusFailed
-				task.Error = s.newError(types.CodeInvalidParams, "Invalid params: "+err.Error(), nil)
-				return
-			}
-
-			outVals := tool.Func.Call(args)
-			result, err := s.handleFunctionOutputs(outVals, &task.Error)
-
-			s.tasksMu.Lock()
-			defer s.tasksMu.Unlock()
-			if err != nil {
-				task.Status = types.TaskStatusFailed
-			} else {
-				task.Status = types.TaskStatusCompleted
-				task.Result = result
-			}
-		}()
-
-		return map[string]interface{}{"taskId": taskID}, nil
+		task, err := s.startToolTask(tool, params.Arguments, 0)
+		if err != nil {
+			*respErrPtr = s.newError(types.CodeServerError, err.Error(), nil)
+			return nil, err
+		}
+		return task, nil
 
 	case "tools/get_result":
-		s.tasksMu.RLock()
-		defer s.tasksMu.RUnlock()
+		s.rwMu.RLock()
+		experimental := s.enableExperimentalMethods
+		s.rwMu.RUnlock()
+		if !experimental {
+			*respErrPtr = s.newError(types.CodeMethodNotFound, "Method not found", nil)
+			return nil, errors.New("experimental methods disabled")
+		}
 		var params struct {
 			TaskID string `json:"taskId"`
 		}
@@ -632,38 +894,98 @@ func (s *Server) routeMethod(req *types.Request, respErrPtr **types.ResponseErro
 			*respErrPtr = s.newError(types.CodeInvalidParams, "Invalid params", nil)
 			return nil, errors.New("param parse error")
 		}
-		task, ok := s.tasks[params.TaskID]
-		if !ok {
-			*respErrPtr = s.newError(types.CodeMethodNotFound, "Task not found", nil)
-			return nil, errors.New("task not found")
+		task, err := s.getTask(params.TaskID)
+		if err != nil {
+			*respErrPtr = s.newError(types.CodeTaskNotFound, "Task not found", nil)
+			return nil, err
+		}
+		return task, nil
+
+	case "tasks/get":
+		var params struct {
+			TaskID string `json:"taskId"`
+		}
+		if err := json.Unmarshal(req.Params, &params); err != nil || params.TaskID == "" {
+			*respErrPtr = s.newError(types.CodeInvalidParams, "taskId is required", nil)
+			return nil, errors.New("invalid task parameters")
+		}
+		task, err := s.getTask(params.TaskID)
+		if err != nil {
+			*respErrPtr = s.newError(types.CodeTaskNotFound, "Task not found", nil)
+			return nil, err
+		}
+		return task, nil
+
+	case "tasks/result":
+		var params struct {
+			TaskID string `json:"taskId"`
+		}
+		if err := json.Unmarshal(req.Params, &params); err != nil || params.TaskID == "" {
+			*respErrPtr = s.newError(types.CodeInvalidParams, "taskId is required", nil)
+			return nil, errors.New("invalid task parameters")
+		}
+		result, err := s.getTaskResult(params.TaskID)
+		if err != nil {
+			*respErrPtr = s.newError(types.CodeServerError, err.Error(), nil)
+			return nil, err
+		}
+		return result, nil
+
+	case "tasks/list":
+		var params struct {
+			Cursor string `json:"cursor,omitempty"`
+		}
+		if len(req.Params) > 0 {
+			if err := json.Unmarshal(req.Params, &params); err != nil {
+				*respErrPtr = s.newError(types.CodeInvalidParams, "Invalid params", nil)
+				return nil, err
+			}
+		}
+		tasks, nextCursor := s.listTasks(params.Cursor)
+		result := map[string]interface{}{"tasks": tasks}
+		if nextCursor != "" {
+			result["nextCursor"] = nextCursor
+		}
+		return result, nil
+
+	case "tasks/cancel":
+		var params struct {
+			TaskID string `json:"taskId"`
+		}
+		if err := json.Unmarshal(req.Params, &params); err != nil || params.TaskID == "" {
+			*respErrPtr = s.newError(types.CodeInvalidParams, "taskId is required", nil)
+			return nil, errors.New("invalid task parameters")
+		}
+		task, err := s.cancelTask(params.TaskID)
+		if err != nil {
+			*respErrPtr = s.newError(types.CodeTaskNotFound, "Task not found", nil)
+			return nil, err
 		}
 		return task, nil
 
 	case "tools/call_stream":
 		s.rwMu.RLock()
-		defer s.rwMu.RUnlock()
+		experimental := s.enableExperimentalMethods
 		var params struct {
 			Name      string                 `json:"name"`
 			Arguments map[string]interface{} `json:"arguments"`
 		}
 		if err := json.Unmarshal(req.Params, &params); err != nil {
+			s.rwMu.RUnlock()
 			*respErrPtr = s.newError(types.CodeInvalidParams, "Invalid params", nil)
 			return nil, errors.New("param parse error")
 		}
 		tool, ok := s.tools[params.Name]
+		s.rwMu.RUnlock()
+		if !experimental {
+			*respErrPtr = s.newError(types.CodeMethodNotFound, "Method not found", nil)
+			return nil, errors.New("experimental methods disabled")
+		}
 		if !ok {
 			*respErrPtr = s.newError(types.CodeMethodNotFound, "Tool not found", nil)
 			return nil, errors.New("tool not found")
 		}
-
-		args, err := s.prepareFuncArgs(tool.ParamTypes, params.Arguments, tool.ParamNames)
-		if err != nil {
-			*respErrPtr = s.newError(types.CodeInvalidParams, "Invalid params: "+err.Error(), nil)
-			return nil, err
-		}
-
-		outVals := tool.Func.Call(args)
-		return s.handleFunctionOutputs(outVals, respErrPtr)
+		return s.invokeTool(ctx, tool, params.Arguments)
 
 	case "prompts/get_stream":
 		s.rwMu.RLock()
@@ -694,9 +1016,14 @@ func (s *Server) routeMethod(req *types.Request, respErrPtr **types.ResponseErro
 	case "resources/list":
 		s.rwMu.RLock()
 		defer s.rwMu.RUnlock()
-		resourcesList := []map[string]interface{}{}
-		for _, res := range s.resources {
+		resources := append([]Resource(nil), s.resources...)
+		sort.Slice(resources, func(i, j int) bool {
+			return resources[i].URITemplate < resources[j].URITemplate
+		})
+		resourcesList := make([]map[string]interface{}, 0, len(resources))
+		for _, res := range resources {
 			resourcesList = append(resourcesList, map[string]interface{}{
+				"name":        res.URITemplate,
 				"uri":         res.URITemplate,
 				"description": res.Description,
 			})
@@ -708,7 +1035,8 @@ func (s *Server) routeMethod(req *types.Request, respErrPtr **types.ResponseErro
 
 	case "resources/read":
 		s.rwMu.RLock()
-		defer s.rwMu.RUnlock()
+		resources := append([]Resource(nil), s.resources...)
+		s.rwMu.RUnlock()
 		var params struct {
 			URI string `json:"uri"`
 		}
@@ -717,25 +1045,20 @@ func (s *Server) routeMethod(req *types.Request, respErrPtr **types.ResponseErro
 			return nil, errors.New("param parse error")
 		}
 		uri := params.URI
-		for _, res := range s.resources {
+		for _, res := range resources {
 			vals, match := util.MatchURI(res.URITemplate, uri)
 			if match {
-				args := []reflect.Value{}
-				for i, v := range vals {
-					if res.Func.Type().In(i).Kind() == reflect.Int {
-						var intVal int64
-						fmt.Sscanf(v, "%d", &intVal)
-						args = append(args, reflect.ValueOf(int(intVal)))
-					} else if res.Func.Type().In(i).Kind() == reflect.Bool {
-						var boolVal bool
-						fmt.Sscanf(v, "%t", &boolVal)
-						args = append(args, reflect.ValueOf(boolVal))
-					} else {
-						args = append(args, reflect.ValueOf(v))
-					}
+				result, err := s.invokeResource(res, uri, vals)
+				if err != nil {
+					*respErrPtr = s.newError(types.CodeServerError, err.Error(), nil)
+					return nil, err
 				}
-				outVals := res.Func.Call(args)
-				return s.handleFunctionOutputs(outVals, respErrPtr)
+				formatted, err := resourceResult(uri, result)
+				if err != nil {
+					*respErrPtr = s.newError(types.CodeInternalError, err.Error(), nil)
+					return nil, err
+				}
+				return formatted, nil
 			}
 		}
 		*respErrPtr = s.newError(types.CodeInvalidParams, "Resource not found", nil)
@@ -744,24 +1067,40 @@ func (s *Server) routeMethod(req *types.Request, respErrPtr **types.ResponseErro
 	case "prompts/list":
 		s.rwMu.RLock()
 		defer s.rwMu.RUnlock()
-		promptsList := []map[string]interface{}{}
-		for _, prompt := range s.prompts {
-			promptsList = append(promptsList, map[string]interface{}{
+		promptNames := make([]string, 0, len(s.prompts))
+		for name := range s.prompts {
+			promptNames = append(promptNames, name)
+		}
+		sort.Strings(promptNames)
+		promptsList := make([]map[string]interface{}, 0, len(s.prompts)+len(s.dynamicPrompts))
+		for _, name := range promptNames {
+			prompt := s.prompts[name]
+			arguments := make([]map[string]interface{}, 0, len(prompt.ParamNames))
+			for _, paramName := range prompt.ParamNames {
+				arguments = append(arguments, map[string]interface{}{
+					"name":     paramName,
+					"required": true,
+				})
+			}
+			entry := map[string]interface{}{
 				"name":        prompt.Name,
 				"description": prompt.Description,
-			})
+			}
+			if len(arguments) > 0 {
+				entry["arguments"] = arguments
+			}
+			promptsList = append(promptsList, entry)
 		}
-		// Add dynamically registered prompts
-		for name, promptDef := range s.dynamicPrompts {
+		dynamicNames := make([]string, 0, len(s.dynamicPrompts))
+		for name := range s.dynamicPrompts {
+			dynamicNames = append(dynamicNames, name)
+		}
+		sort.Strings(dynamicNames)
+		for _, name := range dynamicNames {
+			promptDef := s.dynamicPrompts[name]
 			promptEntry := map[string]interface{}{
 				"name":        name,
 				"description": promptDef.Description,
-				"type":        promptDef.Type,
-			}
-			if promptDef.InputSchema != nil {
-				var schema map[string]interface{}
-				json.Unmarshal(promptDef.InputSchema, &schema)
-				promptEntry["inputSchema"] = schema
 			}
 			promptsList = append(promptsList, promptEntry)
 		}
@@ -772,92 +1111,38 @@ func (s *Server) routeMethod(req *types.Request, respErrPtr **types.ResponseErro
 
 	case "prompts/get":
 		s.rwMu.RLock()
-		defer s.rwMu.RUnlock()
 		var params struct {
 			Name      string                 `json:"name"`
 			Arguments map[string]interface{} `json:"arguments"`
 		}
 		if err := json.Unmarshal(req.Params, &params); err != nil {
+			s.rwMu.RUnlock()
 			*respErrPtr = s.newError(types.CodeInvalidParams, "Invalid params", nil)
 			return nil, errors.New("param parse error")
 		}
 
-		// Check for dynamically registered prompt first
 		if promptDef, ok := s.dynamicPrompts[params.Name]; ok {
-			return s.callDynamicPrompt(promptDef, params.Arguments, respErrPtr)
+			s.rwMu.RUnlock()
+			return s.callDynamicPrompt(ctx, promptDef, params.Arguments, respErrPtr)
 		}
-
-		// Fallback to statically registered Go function prompt
 		prompt, ok := s.prompts[params.Name]
+		s.rwMu.RUnlock()
 		if !ok {
 			*respErrPtr = s.newError(types.CodeMethodNotFound, "Prompt not found", nil)
 			return nil, errors.New("prompt not found")
 		}
-		if prompt.ParamStructType != nil {
-			paramInstance := reflect.New(prompt.ParamStructType).Interface()
-			jsonParams, _ := json.Marshal(params.Arguments)
-			if err := json.Unmarshal(jsonParams, paramInstance); err != nil {
-				*respErrPtr = s.newError(types.CodeInvalidParams, "Invalid params: "+err.Error(), nil)
-				return nil, err
-			}
-			if err := s.validator.Struct(paramInstance); err != nil {
-				*respErrPtr = s.newError(types.CodeInvalidParams, "Validation error: "+err.Error(), nil)
-				return nil, err
-			}
-		}
-		args, err := s.prepareFuncArgs(prompt.ParamTypes, params.Arguments, prompt.ParamNames)
+		value, err := s.invokePrompt(prompt, params.Arguments)
 		if err != nil {
-			*respErrPtr = s.newError(types.CodeInvalidParams, "Invalid params: "+err.Error(), nil)
+			*respErrPtr = s.newError(types.CodeServerError, err.Error(), nil)
 			return nil, err
 		}
-		outVals := prompt.Func.Call(args)
-		if len(outVals) == 0 {
-			result := map[string]interface{}{
-				"description": prompt.Description,
-				"messages":    []types.Message{},
-			}
-			return result, nil
-		}
-		lastIdx := len(outVals) - 1
-		var retErr error = nil
-		var messages interface{}
-		if prompt.Func.Type().NumOut() > 1 && outVals[lastIdx].Interface() != nil {
-			retErr = outVals[lastIdx].Interface().(error)
-		}
-		mainVal := outVals[0]
-		if retErr != nil {
-			*respErrPtr = s.newError(types.CodeServerError, retErr.Error(), nil)
-			return nil, retErr
-		}
-		switch v := mainVal.Interface().(type) {
-		case string:
-			messages = []types.Message{{
-				Role:    "user",
-				Content: types.Content{Type: "text", Text: v},
-			}}
-		case []types.Message:
-			messages = v
-		case []interface{}:
-			var msgList []types.Message
-			for _, m := range v {
-				if msg, ok := m.(types.Message); ok {
-					msgList = append(msgList, msg)
-				}
-			}
-			messages = msgList
-		default:
-			messages = []types.Message{{
-				Role:    "user",
-				Content: types.Content{Type: "text", Text: fmt.Sprintf("%v", v)},
-			}}
-		}
-		result := map[string]interface{}{
-			"description": prompt.Description,
-			"messages":    messages,
-		}
-		return result, nil
+		return promptResult(prompt.Description, value), nil
 
 	case "tools/register":
+		if !s.experimentalMethodsEnabled() {
+			*respErrPtr = s.newError(types.CodeMethodNotFound, "Method not found", nil)
+			return nil, errors.New("experimental methods disabled")
+		}
 		s.rwMu.Lock()
 		defer s.rwMu.Unlock()
 		var toolDef types.ToolDefinition
@@ -865,20 +1150,13 @@ func (s *Server) routeMethod(req *types.Request, respErrPtr **types.ResponseErro
 			*respErrPtr = s.newError(types.CodeInvalidParams, "Invalid params: "+err.Error(), nil)
 			return nil, errors.New("param parse error")
 		}
-
-		if toolDef.Type == "" {
-			*respErrPtr = s.newError(types.CodeInvalidParams, "Tool type is required", nil)
-			return nil, errors.New("tool type missing")
+		if toolDef.Name == "" {
+			*respErrPtr = s.newError(types.CodeInvalidParams, "Tool name is required", nil)
+			return nil, errors.New("tool name missing")
 		}
-
-		if toolDef.Type == "command" && toolDef.Command == nil {
-			*respErrPtr = s.newError(types.CodeInvalidParams, "Command configuration is required for command type tool", nil)
-			return nil, errors.New("command config missing")
-		}
-
-		if toolDef.Type == "http" && toolDef.HTTP == nil {
-			*respErrPtr = s.newError(types.CodeInvalidParams, "HTTP configuration is required for http type tool", nil)
-			return nil, errors.New("http config missing")
+		if err := validateDynamicDefinition(toolDef.Type, toolDef.Command, toolDef.HTTP); err != nil {
+			*respErrPtr = s.newError(types.CodeInvalidParams, err.Error(), nil)
+			return nil, err
 		}
 
 		s.dynamicTools[toolDef.Name] = toolDef
@@ -886,6 +1164,10 @@ func (s *Server) routeMethod(req *types.Request, respErrPtr **types.ResponseErro
 		return map[string]interface{}{"status": "ok", "name": toolDef.Name}, nil
 
 	case "tools/unregister":
+		if !s.experimentalMethodsEnabled() {
+			*respErrPtr = s.newError(types.CodeMethodNotFound, "Method not found", nil)
+			return nil, errors.New("experimental methods disabled")
+		}
 		s.rwMu.Lock()
 		defer s.rwMu.Unlock()
 		var params struct {
@@ -895,15 +1177,19 @@ func (s *Server) routeMethod(req *types.Request, respErrPtr **types.ResponseErro
 			*respErrPtr = s.newError(types.CodeInvalidParams, "Invalid params", nil)
 			return nil, errors.New("param parse error")
 		}
-		if _, ok := s.tools[params.Name]; !ok {
+		if _, ok := s.dynamicTools[params.Name]; !ok {
 			*respErrPtr = s.newError(types.CodeMethodNotFound, "Tool not found", nil)
 			return nil, errors.New("tool not found")
 		}
-		delete(s.tools, params.Name)
+		delete(s.dynamicTools, params.Name)
 		s.logger.Info("Tool unregistered", zap.String("name", params.Name))
 		return map[string]interface{}{"status": "ok"}, nil
 
 	case "prompts/register":
+		if !s.experimentalMethodsEnabled() {
+			*respErrPtr = s.newError(types.CodeMethodNotFound, "Method not found", nil)
+			return nil, errors.New("experimental methods disabled")
+		}
 		s.rwMu.Lock()
 		defer s.rwMu.Unlock()
 		var promptDef types.PromptDefinition
@@ -911,20 +1197,13 @@ func (s *Server) routeMethod(req *types.Request, respErrPtr **types.ResponseErro
 			*respErrPtr = s.newError(types.CodeInvalidParams, "Invalid params: "+err.Error(), nil)
 			return nil, errors.New("param parse error")
 		}
-
-		if promptDef.Type == "" {
-			*respErrPtr = s.newError(types.CodeInvalidParams, "Prompt type is required", nil)
-			return nil, errors.New("prompt type missing")
+		if promptDef.Name == "" {
+			*respErrPtr = s.newError(types.CodeInvalidParams, "Prompt name is required", nil)
+			return nil, errors.New("prompt name missing")
 		}
-
-		if promptDef.Type == "command" && promptDef.Command == nil {
-			*respErrPtr = s.newError(types.CodeInvalidParams, "Command configuration is required for command type prompt", nil)
-			return nil, errors.New("command config missing")
-		}
-
-		if promptDef.Type == "http" && promptDef.HTTP == nil {
-			*respErrPtr = s.newError(types.CodeInvalidParams, "HTTP configuration is required for http type prompt", nil)
-			return nil, errors.New("http config missing")
+		if err := validateDynamicDefinition(promptDef.Type, promptDef.Command, promptDef.HTTP); err != nil {
+			*respErrPtr = s.newError(types.CodeInvalidParams, err.Error(), nil)
+			return nil, err
 		}
 
 		s.dynamicPrompts[promptDef.Name] = promptDef
@@ -932,6 +1211,10 @@ func (s *Server) routeMethod(req *types.Request, respErrPtr **types.ResponseErro
 		return map[string]interface{}{"status": "ok", "name": promptDef.Name}, nil
 
 	case "prompts/unregister":
+		if !s.experimentalMethodsEnabled() {
+			*respErrPtr = s.newError(types.CodeMethodNotFound, "Method not found", nil)
+			return nil, errors.New("experimental methods disabled")
+		}
 		s.rwMu.Lock()
 		defer s.rwMu.Unlock()
 		var params struct {
@@ -941,54 +1224,21 @@ func (s *Server) routeMethod(req *types.Request, respErrPtr **types.ResponseErro
 			*respErrPtr = s.newError(types.CodeInvalidParams, "Invalid params", nil)
 			return nil, errors.New("param parse error")
 		}
-		if _, ok := s.prompts[params.Name]; !ok {
+		if _, ok := s.dynamicPrompts[params.Name]; !ok {
 			*respErrPtr = s.newError(types.CodeMethodNotFound, "Prompt not found", nil)
 			return nil, errors.New("prompt not found")
 		}
-		delete(s.prompts, params.Name)
+		delete(s.dynamicPrompts, params.Name)
 		s.logger.Info("Prompt unregistered", zap.String("name", params.Name))
 		return map[string]interface{}{"status": "ok"}, nil
 
 	case "resources/register":
-		s.rwMu.Lock()
-		defer s.rwMu.Unlock()
-		var params struct {
-			URI         string `json:"uri"`
-			Description string `json:"description"`
-		}
-		if err := json.Unmarshal(req.Params, &params); err != nil {
-			*respErrPtr = s.newError(types.CodeInvalidParams, "Invalid params", nil)
-			return nil, errors.New("param parse error")
-		}
-		s.logger.Info("Resource registration requested", zap.String("uri", params.URI), zap.String("description", params.Description))
-		return map[string]interface{}{"status": "ok", "note": "Dynamic registration is not fully implemented"}, nil
+		*respErrPtr = s.newError(types.CodeMethodNotFound, "Method not found", nil)
+		return nil, errors.New("remote resource registration is not supported")
 
 	case "resources/unregister":
-		s.rwMu.Lock()
-		defer s.rwMu.Unlock()
-		var params struct {
-			URI string `json:"uri"`
-		}
-		if err := json.Unmarshal(req.Params, &params); err != nil {
-			*respErrPtr = s.newError(types.CodeInvalidParams, "Invalid params", nil)
-			return nil, errors.New("param parse error")
-		}
-		found := false
-		var newResources []Resource
-		for _, r := range s.resources {
-			if r.URITemplate == params.URI {
-				found = true
-			} else {
-				newResources = append(newResources, r)
-			}
-		}
-		if !found {
-			*respErrPtr = s.newError(types.CodeMethodNotFound, "Resource not found", nil)
-			return nil, errors.New("resource not found")
-		}
-		s.resources = newResources
-		s.logger.Info("Resource unregistered", zap.String("uri", params.URI))
-		return map[string]interface{}{"status": "ok"}, nil
+		*respErrPtr = s.newError(types.CodeMethodNotFound, "Method not found", nil)
+		return nil, errors.New("remote resource unregistration is not supported")
 
 	default:
 		if respErrPtr != nil {
@@ -998,7 +1248,7 @@ func (s *Server) routeMethod(req *types.Request, respErrPtr **types.ResponseErro
 	}
 }
 
-func (s *Server) callDynamicTool(toolDef types.ToolDefinition, args map[string]interface{}, respErrPtr **types.ResponseError) (interface{}, error) {
+func (s *Server) callDynamicTool(ctx context.Context, toolDef types.ToolDefinition, args map[string]interface{}, respErrPtr **types.ResponseError) (interface{}, error) {
 	s.logger.Info("Calling dynamic tool", zap.String("name", toolDef.Name), zap.String("type", toolDef.Type))
 
 	switch toolDef.Type {
@@ -1007,99 +1257,196 @@ func (s *Server) callDynamicTool(toolDef types.ToolDefinition, args map[string]i
 			*respErrPtr = s.newError(types.CodeInternalError, "Command config missing for command type tool", nil)
 			return nil, errors.New("command config missing")
 		}
-		return s.executeCommand(toolDef.Command, args, respErrPtr)
+		return s.executeCommand(ctx, toolDef.Command, args, respErrPtr)
 	case "http":
 		if toolDef.HTTP == nil {
 			*respErrPtr = s.newError(types.CodeInternalError, "HTTP config missing for http type tool", nil)
 			return nil, errors.New("http config missing")
 		}
-		return s.executeHTTPRequest(toolDef.HTTP, args, respErrPtr)
+		return s.executeHTTPRequest(ctx, toolDef.HTTP, args, respErrPtr)
 	default:
 		*respErrPtr = s.newError(types.CodeInvalidParams, "Unsupported dynamic tool type", nil)
 		return nil, errors.New("unsupported dynamic tool type")
 	}
 }
 
-func (s *Server) executeCommand(cmdConfig *types.CommandConfig, args map[string]interface{}, respErrPtr **types.ResponseError) (interface{}, error) {
-	// Basic command execution. Needs robust sanitization and security.
-	// For simplicity, we'll just append arguments as strings.
-	cmdArgs := make([]string, 0, len(cmdConfig.Args)+len(args))
-	cmdArgs = append(cmdArgs, cmdConfig.Args...)
-	for _, arg := range args {
-		cmdArgs = append(cmdArgs, fmt.Sprintf("%v", arg))
-	}
-
-	cmd := exec.Command(cmdConfig.Path, cmdArgs...)
-	out, err := cmd.CombinedOutput()
+func (s *Server) executeCommand(ctx context.Context, cmdConfig *types.CommandConfig, args map[string]interface{}, respErrPtr **types.ResponseError) (interface{}, error) {
+	resolvedPath, err := exec.LookPath(cmdConfig.Path)
 	if err != nil {
-		*respErrPtr = s.newError(types.CodeServerError, "Command execution failed: "+err.Error(), string(out))
+		*respErrPtr = s.newError(types.CodeInvalidParams, "Command is not available", nil)
 		return nil, err
 	}
-	return string(out), nil
+	s.rwMu.RLock()
+	_, allowed := s.allowedCommandPaths[resolvedPath]
+	timeout := s.commandTimeout
+	maxOutputBytes := s.maxResponseBytes
+	s.rwMu.RUnlock()
+	if !allowed {
+		err := fmt.Errorf("command %q is not allowlisted", resolvedPath)
+		*respErrPtr = s.newError(types.CodeInvalidParams, err.Error(), nil)
+		return nil, err
+	}
+	if cmdConfig.TimeoutMillis > 0 {
+		configuredTimeout := time.Duration(cmdConfig.TimeoutMillis) * time.Millisecond
+		if configuredTimeout < timeout {
+			timeout = configuredTimeout
+		}
+	}
+	commandCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	cmdArgs := make([]string, 0, len(cmdConfig.Args)+len(args))
+	cmdArgs = append(cmdArgs, cmdConfig.Args...)
+	argNames := make([]string, 0, len(args))
+	for name := range args {
+		argNames = append(argNames, name)
+	}
+	sort.Strings(argNames)
+	for _, name := range argNames {
+		cmdArgs = append(cmdArgs, fmt.Sprintf("%v", args[name]))
+	}
+
+	output := newLimitedBuffer(maxOutputBytes)
+	cmd := exec.CommandContext(commandCtx, resolvedPath, cmdArgs...)
+	cmd.Stdout = output
+	cmd.Stderr = output
+	err = cmd.Run()
+	if output.Exceeded() {
+		err = errOutputLimitExceeded
+	}
+	if err != nil {
+		*respErrPtr = s.newError(types.CodeServerError, "Command execution failed: "+err.Error(), output.String())
+		return nil, err
+	}
+	return output.String(), nil
 }
 
-func (s *Server) executeHTTPRequest(httpConfig *types.HTTPConfig, args map[string]interface{}, respErrPtr **types.ResponseError) (interface{}, error) {
-	// Basic HTTP request execution. Needs more advanced features like templating, auth, etc.
-	method := httpConfig.Method
+func (s *Server) executeHTTPRequest(ctx context.Context, httpConfig *types.HTTPConfig, args map[string]interface{}, respErrPtr **types.ResponseError) (interface{}, error) {
+	targetURL, err := url.Parse(httpConfig.URL)
+	if err != nil || (targetURL.Scheme != "http" && targetURL.Scheme != "https") || targetURL.Hostname() == "" {
+		err = errors.New("invalid HTTP target URL")
+		*respErrPtr = s.newError(types.CodeInvalidParams, err.Error(), nil)
+		return nil, err
+	}
+	host := strings.ToLower(targetURL.Hostname())
+	s.rwMu.RLock()
+	_, allowed := s.allowedHTTPHosts[host]
+	if !allowed {
+		_, allowed = s.allowedHTTPHosts[strings.ToLower(targetURL.Host)]
+	}
+	baseClient := s.httpClient
+	maxResponseBytes := s.maxResponseBytes
+	s.rwMu.RUnlock()
+	if !allowed {
+		err = fmt.Errorf("HTTP host %q is not allowlisted", host)
+		*respErrPtr = s.newError(types.CodeInvalidParams, err.Error(), nil)
+		return nil, err
+	}
+	if err := validatePublicHost(ctx, host); err != nil {
+		*respErrPtr = s.newError(types.CodeInvalidParams, err.Error(), nil)
+		return nil, err
+	}
+
+	method := strings.ToUpper(httpConfig.Method)
 	if method == "" {
-		method = "POST" // Default to POST
+		method = http.MethodPost
+	}
+	switch method {
+	case http.MethodGet, http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+	default:
+		err = fmt.Errorf("HTTP method %q is not allowed", method)
+		*respErrPtr = s.newError(types.CodeInvalidParams, err.Error(), nil)
+		return nil, err
 	}
 
 	var reqBody io.Reader
 	if httpConfig.Body != "" {
-		// Simple string replacement for now. Needs proper templating.
 		bodyContent := httpConfig.Body
 		for k, v := range args {
 			bodyContent = strings.ReplaceAll(bodyContent, "{"+k+"}", fmt.Sprintf("%v", v))
 		}
 		reqBody = strings.NewReader(bodyContent)
-	} else if method == "POST" || method == "PUT" || method == "PATCH" {
-		// If no body template, marshal args as JSON for POST/PUT/PATCH
-		jsonArgs, err := json.Marshal(args)
-		if err != nil {
-			*respErrPtr = s.newError(types.CodeInternalError, "Failed to marshal arguments to JSON: "+err.Error(), nil)
-			return nil, err
+	} else if method == http.MethodPost || method == http.MethodPut || method == http.MethodPatch {
+		jsonArgs, marshalErr := json.Marshal(args)
+		if marshalErr != nil {
+			*respErrPtr = s.newError(types.CodeInternalError, "Failed to marshal arguments to JSON: "+marshalErr.Error(), nil)
+			return nil, marshalErr
 		}
 		reqBody = bytes.NewReader(jsonArgs)
 	}
 
-	req, err := http.NewRequest(method, httpConfig.URL, reqBody)
+	requestCtx := ctx
+	cancel := func() {}
+	if httpConfig.TimeoutMillis > 0 {
+		requestCtx, cancel = context.WithTimeout(ctx, time.Duration(httpConfig.TimeoutMillis)*time.Millisecond)
+	}
+	defer cancel()
+	req, err := http.NewRequestWithContext(requestCtx, method, targetURL.String(), reqBody)
 	if err != nil {
 		*respErrPtr = s.newError(types.CodeInternalError, "Failed to create HTTP request: "+err.Error(), nil)
 		return nil, err
 	}
-
 	for k, v := range httpConfig.Headers {
+		if strings.EqualFold(k, "Host") {
+			continue
+		}
 		req.Header.Set(k, v)
 	}
-
-	// Default Content-Type for JSON bodies
-	if (method == "POST" || method == "PUT" || method == "PATCH") && req.Header.Get("Content-Type") == "" {
+	if (method == http.MethodPost || method == http.MethodPut || method == http.MethodPatch) && req.Header.Get("Content-Type") == "" {
 		req.Header.Set("Content-Type", "application/json")
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	client := *baseClient
+	client.CheckRedirect = func(next *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		*respErrPtr = s.newError(types.CodeServerError, "HTTP request failed: "+err.Error(), nil)
 		return nil, err
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(resp.Body)
+	if httpConfig.MaxResponseBytes > 0 && httpConfig.MaxResponseBytes < maxResponseBytes {
+		maxResponseBytes = httpConfig.MaxResponseBytes
+	}
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if err != nil {
 		*respErrPtr = s.newError(types.CodeServerError, "Failed to read HTTP response body: "+err.Error(), nil)
 		return nil, err
 	}
-
-	if resp.StatusCode >= 400 {
-		*respErrPtr = s.newError(types.CodeServerError, fmt.Sprintf("HTTP request failed with status %d: %s", resp.StatusCode, string(respBody)), nil)
-		return nil, errors.New("http request failed")
+	if int64(len(respBody)) > maxResponseBytes {
+		err = fmt.Errorf("HTTP response exceeds %d bytes", maxResponseBytes)
+		*respErrPtr = s.newError(types.CodeServerError, err.Error(), nil)
+		return nil, err
 	}
-
+	if resp.StatusCode >= 400 {
+		err = fmt.Errorf("HTTP request failed with status %d", resp.StatusCode)
+		*respErrPtr = s.newError(types.CodeServerError, err.Error(), string(respBody))
+		return nil, err
+	}
 	return string(respBody), nil
 }
 
-func (s *Server) callDynamicPrompt(promptDef types.PromptDefinition, args map[string]interface{}, respErrPtr **types.ResponseError) (interface{}, error) {
+func validatePublicHost(ctx context.Context, host string) error {
+	addresses, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return fmt.Errorf("resolve HTTP host %q: %w", host, err)
+	}
+	if len(addresses) == 0 {
+		return fmt.Errorf("HTTP host %q has no addresses", host)
+	}
+	for _, address := range addresses {
+		ip := address.IP
+		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
+			ip.IsLinkLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast() {
+			return fmt.Errorf("HTTP host %q resolves to a non-public address", host)
+		}
+	}
+	return nil
+}
+
+func (s *Server) callDynamicPrompt(ctx context.Context, promptDef types.PromptDefinition, args map[string]interface{}, respErrPtr **types.ResponseError) (interface{}, error) {
 	s.logger.Info("Calling dynamic prompt", zap.String("name", promptDef.Name), zap.String("type", promptDef.Type))
 
 	switch promptDef.Type {
@@ -1108,7 +1455,7 @@ func (s *Server) callDynamicPrompt(promptDef types.PromptDefinition, args map[st
 			*respErrPtr = s.newError(types.CodeInternalError, "Command config missing for command type prompt", nil)
 			return nil, errors.New("command config missing")
 		}
-		output, err := s.executeCommand(promptDef.Command, args, respErrPtr)
+		output, err := s.executeCommand(ctx, promptDef.Command, args, respErrPtr)
 		if err != nil {
 			return nil, err
 		}
@@ -1123,7 +1470,7 @@ func (s *Server) callDynamicPrompt(promptDef types.PromptDefinition, args map[st
 			*respErrPtr = s.newError(types.CodeInternalError, "HTTP config missing for http type prompt", nil)
 			return nil, errors.New("http config missing")
 		}
-		output, err := s.executeHTTPRequest(promptDef.HTTP, args, respErrPtr)
+		output, err := s.executeHTTPRequest(ctx, promptDef.HTTP, args, respErrPtr)
 		if err != nil {
 			return nil, err
 		}
@@ -1190,7 +1537,7 @@ func (s *Server) handleFunctionOutputs(outVals []reflect.Value, respErrPtr **typ
 }
 
 func (s *Server) prepareFuncArgs(paramTypes []reflect.Type, argsMap map[string]interface{}, paramNames []string) ([]reflect.Value, error) {
-	args := []reflect.Value{}
+	args := make([]reflect.Value, 0, len(paramTypes))
 	for i, pType := range paramTypes {
 		name := paramNames[i]
 		val, ok := argsMap[name]
@@ -1252,11 +1599,14 @@ func (s *Server) PublishNotification(method string, params interface{}) {
 	}
 }
 
-func (s *Server) handleStreamRequest(req *types.Request, w http.ResponseWriter, flusher http.Flusher) {
+func (s *Server) handleStreamRequest(ctx context.Context, req *types.Request, w http.ResponseWriter, flusher http.Flusher) {
 	var respErr *types.ResponseError
-	result, err := s.routeMethod(req, &respErr)
+	result, err := s.routeMethod(ctx, req, &respErr)
 
 	if err != nil {
+		if respErr == nil {
+			respErr = s.newError(types.CodeInternalError, err.Error(), nil)
+		}
 		resp := s.makeErrorResponse(req.ID, respErr.Code, respErr.Message, respErr.Data)
 		data, _ := json.Marshal(resp)
 		fmt.Fprintf(w, "data: %s\n\n", data)
@@ -1264,33 +1614,42 @@ func (s *Server) handleStreamRequest(req *types.Request, w http.ResponseWriter, 
 		return
 	}
 
-	// Check if the result is a channel
-	val := reflect.ValueOf(result)
-	if val.Kind() != reflect.Chan {
-		// Not a streaming response, just send the single result
+	value := reflect.ValueOf(result)
+	if value.Kind() != reflect.Chan {
 		resp := types.Response{ID: req.ID, JSONRPC: "2.0", Result: result}
 		data, _ := json.Marshal(resp)
 		fmt.Fprintf(w, "data: %s\n\n", data)
 		flusher.Flush()
 		return
 	}
+	if value.IsNil() || value.Type().ChanDir() == reflect.SendDir {
+		resp := s.makeErrorResponse(req.ID, types.CodeInternalError, "Handler returned an unreadable channel", nil)
+		data, _ := json.Marshal(resp)
+		_, _ = fmt.Fprintf(w, "data: %s\n\n", data)
+		flusher.Flush()
+		return
+	}
 
-	// It's a streaming response, listen on the channel
 	for {
-		item, ok := val.Recv()
-		if !ok {
-			// Channel closed, we are done.
-			break
+		selected, item, ok := reflect.Select([]reflect.SelectCase{
+			{Dir: reflect.SelectRecv, Chan: value},
+			{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(ctx.Done())},
+		})
+		if selected == 1 {
+			return
 		}
-
-		// Create a partial response
+		if !ok {
+			return
+		}
 		partialResp := types.Response{
 			ID:      req.ID,
 			JSONRPC: "2.0",
 			Result:  item.Interface(),
 		}
 		data, _ := json.Marshal(partialResp)
-		fmt.Fprintf(w, "data: %s\n\n", data)
+		if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
+			return
+		}
 		flusher.Flush()
 	}
 }
